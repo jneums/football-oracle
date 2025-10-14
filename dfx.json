@@ -1,0 +1,18 @@
+{
+  "canisters": {
+    "main": {
+      "main": "./src/main.mo",
+      "type": "motoko",
+      "gzip": true,
+      "init_arg": "(record { oracleArgs = null; ttArgs = null })"
+    }
+
+  },
+  "defaults": {
+    "build": {
+      "args": "",
+      "packtool": "mops sources"
+    }
+  },
+  "version": 1
+}

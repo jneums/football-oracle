@@ -1,0 +1,269 @@
+// Football Oracle Main Canister
+// This canister provides an event-sourced oracle for football match outcomes
+
+import D "mo:base/Debug";
+import Principal "mo:base/Principal";
+import ClassPlus "mo:class-plus";
+import TT "mo:timer-tool";
+import Log "mo:stable-local-log";
+import ICRC3 "mo:icrc3-mo";
+import Text "mo:base/Text";
+import Map "mo:map/Map";
+import CertTree "mo:cert/CertTree";
+import Array "mo:base/Array";
+import Option "mo:base/Option";
+
+// Import the local library and its service definition
+import Oracle "lib";
+import Service "service";
+import HttpTypes "http/types";
+
+// The main football oracle canister actor
+shared (deployer) actor class FootballOracleCanister<system>(
+  args : {
+    oracleArgs : ?Oracle.InitArgs;
+    ttArgs : ?TT.InitArgList;
+  }
+) = this {
+
+  // HTTP Transform function to strip non-deterministic headers for consensus
+  public query func transform(args : { context : Blob; response : HttpTypes.HttpResponse }) : async HttpTypes.HttpResponse {
+    {
+      args.response with headers = []; // Strip all headers for deterministic consensus
+    };
+  };
+
+  // This private helper function converts the oracle value type
+  // into the simpler Value type expected by the ICRC3 logger.
+  private func convertOracleValueToIcrc3Value(val : Oracle.ICRC16) : ICRC3.Value {
+    switch (val) {
+      case (#Nat(n)) { return #Nat(n) };
+      case (#Int(i)) { return #Int(i) };
+      case (#Text(t)) { return #Text(t) };
+      case (#Blob(b)) { return #Blob(b) };
+      case (#Array(arr)) {
+        let converted_arr = Array.map<Oracle.ICRC16, ICRC3.Value>(arr, convertOracleValueToIcrc3Value);
+        return #Array(converted_arr);
+      };
+      case (#Map(map)) {
+        let converted_map = Array.map<(Text, Oracle.ICRC16), (Text, ICRC3.Value)>(map, func((k, v)) { (k, convertOracleValueToIcrc3Value(v)) });
+        return #Map(converted_map);
+      };
+      case (#Bool(b)) { return #Text(debug_show (b)) };
+      case (#Principal(p)) { return #Text(Principal.toText(p)) };
+      case (_) {
+        return #Text("Unsupported ICRC-3 Value Type");
+      };
+    };
+  };
+
+  let thisPrincipal = Principal.fromActor(this);
+  stable var _owner = deployer.caller;
+
+  let initManager = ClassPlus.ClassPlusInitializationManager(_owner, thisPrincipal, true);
+  let oracleInitArgs = args.oracleArgs;
+  let ttInitArgs : ?TT.InitArgList = args.ttArgs;
+
+  // --- TimerTool Setup ---
+  private func reportTTExecution(execInfo : TT.ExecutionReport) : Bool {
+    D.print("CANISTER: TimerTool Execution: " # debug_show (execInfo));
+    false;
+  };
+  private func reportTTError(errInfo : TT.ErrorReport) : ?Nat {
+    D.print("CANISTER: TimerTool Error: " # debug_show (errInfo));
+    null;
+  };
+  stable var tt_migration_state : TT.State = TT.Migration.migration.initialState;
+  let tt = TT.Init<system>({
+    manager = initManager;
+    initialState = tt_migration_state;
+    args = ttInitArgs;
+    pullEnvironment = ?(
+      func() : TT.Environment {
+        {
+          advanced = null;
+          reportExecution = ?reportTTExecution;
+          reportError = ?reportTTError;
+          syncUnsafe = null;
+          reportBatch = null;
+        };
+      }
+    );
+    onInitialize = null;
+    onStorageChange = func(state : TT.State) { tt_migration_state := state };
+  });
+
+  // --- Logger Setup ---
+  stable var localLog_migration_state : Log.State = Log.initialState();
+  let localLog = Log.Init<system>({
+    args = ?{ min_level = ?#Debug; bufferSize = ?5000 };
+    manager = initManager;
+    initialState = localLog_migration_state;
+    pullEnvironment = ?(
+      func() : Log.Environment {
+        { tt = tt(); advanced = null; onEvict = null };
+      }
+    );
+    onInitialize = null;
+    onStorageChange = func(state : Log.State) {
+      localLog_migration_state := state;
+    };
+  });
+
+  // --- ICRC3 Integration ---
+  stable let cert_store : CertTree.Store = CertTree.newStore();
+  let ct = CertTree.Ops(cert_store);
+
+  private func get_certificate_store() : CertTree.Store {
+    cert_store;
+  };
+
+  private func updated_certification(_cert : Blob, _lastIndex : Nat) : Bool {
+    ct.setCertifiedData();
+    true;
+  };
+
+  private func get_icrc3_environment() : ICRC3.Environment {
+    {
+      updated_certification = ?updated_certification;
+      get_certificate_store = ?get_certificate_store;
+    };
+  };
+
+  stable var icrc3_migration_state = ICRC3.initialState();
+  let icrc3 = ICRC3.Init<system>({
+    manager = initManager;
+    initialState = icrc3_migration_state;
+    args = null;
+    pullEnvironment = ?get_icrc3_environment;
+    onInitialize = ?(
+      func(newClass : ICRC3.ICRC3) : async* () {
+        if (newClass.stats().supportedBlocks.size() == 0) {
+          newClass.update_supported_blocks([
+            {
+              block_type = "oracle_event";
+              url = "https://github.com/soccer-oracle";
+            },
+          ]);
+        };
+      }
+    );
+    onStorageChange = func(state : ICRC3.State) {
+      icrc3_migration_state := state;
+    };
+  });
+
+  // --- Football Oracle Library Setup ---
+  stable var oracle_migration_state : Oracle.State = Oracle.initialState();
+  let oracle = Oracle.Init<system>({
+    manager = initManager;
+    initialState = oracle_migration_state;
+    args = oracleInitArgs;
+    pullEnvironment = ?(
+      func() : Oracle.Environment {
+        {
+          tt = tt();
+          advanced = null;
+          log = localLog();
+          add_record = ?(
+            func<system>(data : Oracle.ICRC16, meta : ?Oracle.ICRC16) : Nat {
+              let converted_data = convertOracleValueToIcrc3Value(data);
+              let converted_meta = Option.map(meta, convertOracleValueToIcrc3Value);
+              D.print("ORACLE: Adding record: " # debug_show ((converted_data, converted_meta)));
+              icrc3().add_record<system>(converted_data, converted_meta);
+            }
+          );
+          transform_canister = ?thisPrincipal;
+        };
+      }
+    );
+    onStorageChange = func(state) { oracle_migration_state := state };
+    onInitialize = ?(
+      func(_oracleInstance : Oracle.FootballOracle) : async* () {
+        D.print("ORACLE: Initialized");
+      }
+    );
+  });
+
+  // --- Public API Implementation ---
+
+  // Admin method to set an API key
+  public shared (msg) func set_api_key(provider : Text, key : Text) : async Service.SetApiKeyResult {
+    oracle().set_api_key(msg.caller, provider, key);
+  };
+
+  // Admin method to set monitored leagues
+  public shared (msg) func set_monitored_leagues(req : Service.SetMonitoredLeaguesRequest) : async Service.SetLeaguesResult {
+    oracle().set_monitored_leagues(msg.caller, req.leagueIds);
+  };
+
+  // Admin method to start discovery timer
+  public shared (msg) func start_discovery_timer() : async Service.StartDiscoveryResult {
+    await* oracle().start_discovery_timer<system>(msg.caller);
+  };
+
+  // Admin method to manually trigger discovery (for testing)
+  public shared (msg) func trigger_discovery() : async () {
+    await* oracle().trigger_discovery<system>(msg.caller);
+  };
+
+  // Admin method to schedule a match for monitoring (manual override)
+  public shared (msg) func schedule_match(req : Service.ScheduleMatchRequest) : async Service.ScheduleResult {
+    await* oracle().schedule_match<system>(msg.caller, req);
+  };
+
+  // Admin method to fetch match data by Oracle ID
+  public shared (msg) func fetch_match_data(req : Service.FetchMatchDataRequest) : async Service.FetchResult {
+    await* oracle().fetch_match_data<system>(msg.caller, req.oracleId);
+  };
+
+  // Public query to get all scheduled matches
+  public query func get_scheduled_matches() : async [Service.ScheduledMatchInfo] {
+    oracle().get_scheduled_matches();
+  };
+
+  // Public query to get monitored leagues
+  public query func get_monitored_leagues() : async [Nat] {
+    oracle().get_monitored_leagues();
+  };
+
+  // Public query to get all events for a match by Oracle ID
+  public query func get_match_events(oracleId : Nat) : async Service.EventsResult {
+    oracle().get_match_events(oracleId);
+  };
+
+  // Query to get the latest event for a match by Oracle ID
+  public query func get_latest_event(oracleId : Nat) : async ?Service.OracleEvent {
+    oracle().get_latest_event(oracleId);
+  };
+
+  // Get oracle statistics
+  public query func get_stats() : async Oracle.Stats {
+    oracle().get_stats();
+  };
+
+  // --- ICRC3 Endpoints ---
+  public query func icrc3_get_blocks(args : ICRC3.GetBlocksArgs) : async ICRC3.GetBlocksResult {
+    icrc3().get_blocks(args);
+  };
+  public query func icrc3_get_archives(args : ICRC3.GetArchivesArgs) : async ICRC3.GetArchivesResult {
+    icrc3().get_archives(args);
+  };
+  public query func icrc3_supported_block_types() : async [ICRC3.BlockType] {
+    icrc3().supported_block_types();
+  };
+  public query func icrc3_get_tip_certificate() : async ?ICRC3.DataCertificate {
+    icrc3().get_tip_certificate();
+  };
+  public query func get_tip() : async ICRC3.Tip {
+    icrc3().get_tip();
+  };
+
+  // --- Helper query function for tests ---
+  public shared query func get_match_record(oracleId : Nat) : async ?Oracle.MatchRecord {
+    switch (Map.get(oracle().state.matches, Map.nhash, oracleId)) {
+      case (null) { null };
+      case (?record) { ?record };
+    };
+  };
+};
