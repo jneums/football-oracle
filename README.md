@@ -52,8 +52,10 @@ public query func transform(args : {
 ```
 
 **Configuration:**
-- `max_response_bytes = null` (disables consensus requirement, allows unlimited size)
-- Cycle cost: 21B cycles per HTTP request
+- `max_response_bytes = null` (allows unlimited response size)
+- Transform function strips headers to achieve consensus across replicas
+- Without transform: replicas receive different headers (date, rate-limit, etc.) causing consensus failures
+- Cycle cost: 21B cycles per HTTP request (higher due to unlimited size)
 - API: API-Football v3 (paid plan with "next" parameter for discovery)
 
 ### Core Data Types
@@ -333,10 +335,11 @@ dfx canister call main icrc3_get_blocks '(vec {record {start = 0:nat; length = 1
 
 ### Cycle Consumption
 
-- **HTTP Request:** 21B cycles each (max_response_bytes = null)
+- **HTTP Request:** 21B cycles each (unlimited response size)
 - **Discovery:** ~7 leagues × 21B = ~147B cycles/day
 - **Active Match:** ~12 fetches × 21B = ~252B cycles per match
 - **Optimization:** Only logs to ICRC-3 on score changes (50% reduction)
+- **Transform function:** Required for consensus across replicas (strips non-deterministic headers)
 
 ### Current Load
 
@@ -393,7 +396,11 @@ public query func transform(args : {
 };
 ```
 
-This strips all headers (date, rate-limit, request-id, etc.) which would otherwise cause consensus failures.
+**Why it's needed:**
+- HTTP responses include non-deterministic headers (date, rate-limit, request-id, etc.)
+- Without transform: each replica gets different headers → different response hashes → consensus failure
+- With transform: headers are stripped → identical response bodies → consensus achieved
+- This is **required** for IC HTTP outcalls to work reliably across the subnet
 
 ### Oracle ID System
 
