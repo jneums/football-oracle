@@ -137,6 +137,9 @@ module {
       };
     };
 
+    // Non-stable timer ID for hourly upcoming match checks (will be restarted in postupgrade)
+    var upcomingMatchCheckTimerId : ?Nat = null;
+
     /// Set an API key
     public func set_api_key(caller : Principal, provider : Text, key : Text) : Service.SetApiKeyResult {
       // Verify caller is admin
@@ -161,6 +164,52 @@ module {
       state.monitoredLeagues := leagueIds;
       D.print("ORACLE: Set monitored leagues: " # debug_show (leagueIds));
 
+      #Ok;
+    };
+
+    /// Add a league to monitored leagues
+    public func add_league(caller : Principal, leagueId : Nat) : Service.SetLeaguesResult {
+      // Verify caller is admin
+      if (not Principal.equal(caller, state.admin)) {
+        return #Error(#Unauthorized);
+      };
+
+      // Check if league is already monitored
+      let alreadyMonitored = Array.find<Nat>(state.monitoredLeagues, func(id) { id == leagueId });
+
+      switch (alreadyMonitored) {
+        case (?_) {
+          D.print("ORACLE: League " # Nat.toText(leagueId) # " is already monitored");
+          #Ok; // Already exists, return success
+        };
+        case (null) {
+          // Add the league
+          let buffer = Buffer.fromArray<Nat>(state.monitoredLeagues);
+          buffer.add(leagueId);
+          state.monitoredLeagues := Buffer.toArray(buffer);
+          D.print("ORACLE: Added league " # Nat.toText(leagueId) # " to monitored leagues");
+          #Ok;
+        };
+      };
+    };
+
+    /// Remove a league from monitored leagues
+    public func remove_league(caller : Principal, leagueId : Nat) : Service.SetLeaguesResult {
+      // Verify caller is admin
+      if (not Principal.equal(caller, state.admin)) {
+        return #Error(#Unauthorized);
+      };
+
+      // Filter out the league
+      let filtered = Array.filter<Nat>(state.monitoredLeagues, func(id) { id != leagueId });
+
+      if (filtered.size() == state.monitoredLeagues.size()) {
+        D.print("ORACLE: League " # Nat.toText(leagueId) # " was not found in monitored leagues");
+      } else {
+        D.print("ORACLE: Removed league " # Nat.toText(leagueId) # " from monitored leagues");
+      };
+
+      state.monitoredLeagues := filtered;
       #Ok;
     };
 
@@ -289,26 +338,135 @@ module {
         null;
       };
 
-      // Use API-Football result or fallback
-      let (homeScore, awayScore) = switch (apiFootballResult) {
+      // Validate match status and extract scores
+      let (homeScore, awayScore, matchStatus) = switch (apiFootballResult) {
         case (?result) {
-          D.print("ORACLE: API-Football result: " # debug_show (result.home) # "-" # debug_show (result.away));
-          (result.home, result.away);
+          D.print("ORACLE: API-Football result: " # debug_show (result.home) # "-" # debug_show (result.away) # " (status: " # debug_show (result.status) # ")");
+
+          // Validate status - don't log scores for matches that haven't started
+          switch (result.status) {
+            case (#NotStarted) {
+              D.print("ORACLE: Match hasn't started yet, ignoring score data");
+              return #Error(#Generic("Match not started"));
+            };
+            case (#Postponed or #Cancelled or #Abandoned) {
+              D.print("ORACLE: Match was postponed/cancelled/abandoned: " # debug_show (result.status));
+
+              // Create cancellation event
+              let reasonText = switch (result.status) {
+                case (#Postponed) { "Postponed" };
+                case (#Cancelled) { "Cancelled" };
+                case (#Abandoned) { "Abandoned" };
+                case (_) { "Unknown" };
+              };
+
+              let cancellationEvent : OracleEvent = {
+                oracleId = oracleId;
+                timestamp = now;
+                eventType = #MatchCancelled;
+                eventData = #MatchCancelled({
+                  homeTeam = scheduledMatch.homeTeam;
+                  awayTeam = scheduledMatch.awayTeam;
+                  reason = reasonText;
+                });
+                sourceConsensus = [{
+                  provider = "API-Football";
+                  url = API_FOOTBALL_URL # "/fixtures?id=" # scheduledMatch.apiFootballId;
+                  timestamp = now;
+                }];
+              };
+
+              // Update match record to Cancelled status
+              let matchRecord : MatchRecord = switch (Map.get(state.matches, Map.nhash, oracleId)) {
+                case (null) {
+                  {
+                    oracleId = oracleId;
+                    apiFootballId = scheduledMatch.apiFootballId;
+                    status = #Cancelled;
+                    events = [cancellationEvent];
+                    lastUpdated = now;
+                  };
+                };
+                case (?existing) {
+                  {
+                    oracleId = existing.oracleId;
+                    apiFootballId = existing.apiFootballId;
+                    status = #Cancelled;
+                    events = Array.append(existing.events, [cancellationEvent]);
+                    lastUpdated = now;
+                  };
+                };
+              };
+              Map.set(state.matches, Map.nhash, oracleId, matchRecord);
+
+              // Update scheduled match status
+              let updatedScheduledMatch : ScheduledMatch = {
+                oracleId = scheduledMatch.oracleId;
+                apiFootballId = scheduledMatch.apiFootballId;
+                scheduledTime = scheduledMatch.scheduledTime;
+                homeTeam = scheduledMatch.homeTeam;
+                awayTeam = scheduledMatch.awayTeam;
+                league = scheduledMatch.league;
+                status = #Cancelled;
+                lastFetchTime = ?now;
+                matchTimerId = scheduledMatch.matchTimerId;
+              };
+              Map.set(state.scheduledMatches, Map.nhash, oracleId, updatedScheduledMatch);
+
+              // Stop the timer to save cycles
+              switch (scheduledMatch.matchTimerId) {
+                case (?timerId) {
+                  D.print("ORACLE: Stopping timer for cancelled match (Oracle ID: " # debug_show (oracleId) # ")");
+                  Timer.cancelTimer(timerId);
+
+                  // Clear timer ID from scheduled match
+                  let finalScheduledMatch : ScheduledMatch = {
+                    updatedScheduledMatch with matchTimerId = null;
+                  };
+                  Map.set(state.scheduledMatches, Map.nhash, oracleId, finalScheduledMatch);
+                };
+                case (null) {
+                  D.print("ORACLE: No active timer to stop for cancelled match");
+                };
+              };
+
+              // Log cancellation event to ICRC-3
+              D.print("ORACLE: Logging cancellation to ICRC-3");
+              let txId = logOracleEvent<system>(cancellationEvent);
+              D.print("ORACLE: Cancellation logged with block index: " # debug_show (txId));
+
+              return #Ok(txId);
+            };
+            case (#Unknown) {
+              D.print("ORACLE: WARNING - Unknown match status, proceeding with caution");
+            };
+            case (#InProgress or #Finished) {
+              // Valid states for logging scores
+            };
+          };
+
+          (result.home, result.away, result.status);
         };
         case (null) {
-          D.print("ORACLE: API fetch failed, using mock data");
-          // Fallback to mock data if fetch fails
-          (2, 2); // Default draw
+          D.print("ORACLE: API fetch failed, cannot determine match status");
+          return #Error(#ApiError("Failed to fetch match data"));
         };
       };
 
-      // Determine outcome
-      let outcome : MatchOutcome = if (homeScore > awayScore) {
-        #HomeWin;
-      } else if (awayScore > homeScore) {
-        #AwayWin;
-      } else {
-        #Draw;
+      // Determine outcome only for finished matches
+      let outcome : ?MatchOutcome = switch (matchStatus) {
+        case (#Finished) {
+          ?(
+            if (homeScore > awayScore) {
+              #HomeWin;
+            } else if (awayScore > homeScore) {
+              #AwayWin;
+            } else {
+              #Draw;
+            }
+          );
+        };
+        case (_) { null }; // No outcome for in-progress or other states
       };
 
       // Create API source record
@@ -321,24 +479,50 @@ module {
       // Check if this is a new score or the first fetch
       let shouldLog = switch (Map.get(state.matches, Map.nhash, oracleId)) {
         case (null) {
-          // First fetch - always log
-          true;
+          // First fetch - log if match is in progress or finished (but not if not started)
+          switch (matchStatus) {
+            case (#InProgress or #Finished) { true };
+            case (_) { false };
+          };
         };
         case (?existing) {
           // Check if there are any events
           if (existing.events.size() == 0) {
-            true; // No events yet, log this one
+            // No events yet, log if match started
+            switch (matchStatus) {
+              case (#InProgress or #Finished) { true };
+              case (_) { false };
+            };
           } else {
-            // Check if score changed by comparing with latest event
+            // Check if we should log based on event type and score changes
             let lastEvent = existing.events[existing.events.size() - 1];
             switch (lastEvent.eventData) {
               case (#MatchFinal(data)) {
-                // Log only if score changed
+                // Already final, only log if score changed (rare case of correction)
                 data.homeScore != homeScore or data.awayScore != awayScore;
               };
+              case (#MatchInProgress(data)) {
+                // If match finished, ALWAYS log #MatchFinal regardless of score
+                // Otherwise, only log if score changed
+                switch (matchStatus) {
+                  case (#Finished) { true }; // Status changed to finished - always log
+                  case (#InProgress) {
+                    // Still in progress, only log if score changed
+                    data.homeScore != homeScore or data.awayScore != awayScore;
+                  };
+                  case (_) { false };
+                };
+              };
               case (#MatchScheduled(_)) {
-                // Last event was scheduling, this is first score update - log it
-                true;
+                // Last event was scheduling, this is first score update - log it if match started
+                switch (matchStatus) {
+                  case (#InProgress or #Finished) { true };
+                  case (_) { false };
+                };
+              };
+              case (#MatchCancelled(_)) {
+                // Match was cancelled, don't log anything more
+                false;
               };
             };
           };
@@ -346,27 +530,75 @@ module {
       };
 
       // Create oracle event with Oracle ID (only if we'll log it)
-      let event : OracleEvent = {
-        oracleId = oracleId;
-        timestamp = now;
-        eventType = #MatchFinal;
-        eventData = #MatchFinal({
-          homeTeam = scheduledMatch.homeTeam;
-          awayTeam = scheduledMatch.awayTeam;
-          homeScore = homeScore;
-          awayScore = awayScore;
-          outcome = outcome;
-        });
-        sourceConsensus = [apiSource];
+      // Use different event types based on match status
+      let event : OracleEvent = switch (matchStatus) {
+        case (#InProgress) {
+          {
+            oracleId = oracleId;
+            timestamp = now;
+            eventType = #MatchInProgress;
+            eventData = #MatchInProgress({
+              homeTeam = scheduledMatch.homeTeam;
+              awayTeam = scheduledMatch.awayTeam;
+              homeScore = homeScore;
+              awayScore = awayScore;
+              minute = null; // TODO: Could extract this from API if needed
+            });
+            sourceConsensus = [apiSource];
+          };
+        };
+        case (#Finished) {
+          // Only create MatchFinal event if we have an outcome
+          let finalOutcome = switch (outcome) {
+            case (?o) { o };
+            case (null) { #Draw }; // Fallback, shouldn't happen
+          };
+          {
+            oracleId = oracleId;
+            timestamp = now;
+            eventType = #MatchFinal;
+            eventData = #MatchFinal({
+              homeTeam = scheduledMatch.homeTeam;
+              awayTeam = scheduledMatch.awayTeam;
+              homeScore = homeScore;
+              awayScore = awayScore;
+              outcome = finalOutcome;
+            });
+            sourceConsensus = [apiSource];
+          };
+        };
+        case (_) {
+          // Shouldn't reach here due to earlier validation, but provide a default
+          {
+            oracleId = oracleId;
+            timestamp = now;
+            eventType = #MatchInProgress;
+            eventData = #MatchInProgress({
+              homeTeam = scheduledMatch.homeTeam;
+              awayTeam = scheduledMatch.awayTeam;
+              homeScore = homeScore;
+              awayScore = awayScore;
+              minute = null;
+            });
+            sourceConsensus = [apiSource];
+          };
+        };
       };
 
       // Update match record - only append event if score changed
+      let recordStatus : MatchStatus = switch (matchStatus) {
+        case (#Finished) { #Final };
+        case (#InProgress) { #InProgress };
+        case (#Postponed or #Cancelled or #Abandoned) { #Cancelled };
+        case (_) { #Scheduled }; // NotStarted or Unknown
+      };
+
       let matchRecord : MatchRecord = switch (Map.get(state.matches, Map.nhash, oracleId)) {
         case (null) {
           {
             oracleId = oracleId;
             apiFootballId = scheduledMatch.apiFootballId;
-            status = #Final;
+            status = recordStatus;
             events = [event];
             lastUpdated = now;
           };
@@ -375,7 +607,7 @@ module {
           {
             oracleId = existing.oracleId;
             apiFootballId = existing.apiFootballId;
-            status = #Final;
+            status = recordStatus;
             events = if (shouldLog) {
               Array.append(existing.events, [event]);
             } else {
@@ -396,11 +628,23 @@ module {
         homeTeam = scheduledMatch.homeTeam;
         awayTeam = scheduledMatch.awayTeam;
         league = scheduledMatch.league;
-        status = #Final;
+        status = recordStatus;
         lastFetchTime = ?now;
-        matchTimerId = scheduledMatch.matchTimerId; // Preserve existing timer ID
+        matchTimerId = scheduledMatch.matchTimerId; // Will be updated by restart_match_timer
       };
       Map.set(state.scheduledMatches, Map.nhash, oracleId, updatedScheduledMatch);
+
+      // If match is still scheduled or in progress, always restart timer
+      // This ensures timer is running even after upgrades (where base Timer is lost)
+      switch (recordStatus) {
+        case (#Scheduled or #InProgress) {
+          D.print("ORACLE: Restarting timer for Oracle ID " # debug_show (oracleId));
+          await* start_match_timer<system>(oracleId);
+        };
+        case (_) {
+          // Match is finished or cancelled, no timer needed
+        };
+      };
 
       // Log to ICRC-3 only if score changed or first fetch
       let txId = if (shouldLog) {
@@ -460,9 +704,20 @@ module {
       await* discover_matches<system>();
     };
 
-    /// Discover new matches from API-Football for monitored leagues
-    private func discover_matches<system>() : async* () {
-      D.print("ORACLE: Discovering matches for leagues: " # debug_show (state.monitoredLeagues));
+    /// Manually trigger discovery for a specific league
+    public func trigger_discovery_for_league<system>(caller : Principal, leagueId : Nat) : async* () {
+      // Verify caller is admin
+      if (not Principal.equal(caller, state.admin)) {
+        return;
+      };
+
+      D.print("ORACLE: Triggering discovery for league: " # debug_show (leagueId));
+      await* discover_matches_for_league<system>(leagueId);
+    };
+
+    /// Discover new matches for a specific league
+    private func discover_matches_for_league<system>(leagueId : Nat) : async* () {
+      D.print("ORACLE: Discovering matches for league: " # debug_show (leagueId));
 
       // Try both key formats (lowercase and original)
       let apiFootballKey = switch (Map.get(state.apiKeys, Map.thash, "api_football")) {
@@ -478,55 +733,57 @@ module {
         };
       };
 
+      try {
+        // Get upcoming fixtures (paid plan - uses "next" parameter)
+        let url = API_FOOTBALL_URL # "/fixtures?league=" # Nat.toText(leagueId) # "&next=10";
+
+        // Create transform context if canister is available
+        let transformContext : ?HttpTypes.TransformContext = switch (environment.transform_canister) {
+          case (?canister) {
+            let actor_ref : actor {
+              transform : shared query ({
+                context : Blob;
+                response : HttpTypes.HttpResponse;
+              }) -> async HttpTypes.HttpResponse;
+            } = actor (Principal.toText(canister));
+            ?{
+              function = actor_ref.transform;
+              context = Blob.fromArray([]);
+            };
+          };
+          case (null) { null };
+        };
+
+        let response = await* HttpClient.makeRequest(
+          url,
+          [
+            { name = "x-apisports-key"; value = apiFootballKey },
+          ],
+          transformContext,
+        );
+
+        let bodyText = switch (Text.decodeUtf8(response.body)) {
+          case null { "" };
+          case (?text) { text };
+        };
+
+        D.print("ORACLE: Discovery response for league " # debug_show (leagueId) # ": " # bodyText);
+
+        // Parse and schedule matches
+        await* parse_and_schedule_fixtures<system>(bodyText, leagueId);
+
+      } catch (e) {
+        D.print("ORACLE: Discovery error for league " # debug_show (leagueId) # ": " # Error.message(e));
+      };
+    };
+
+    /// Discover new matches from API-Football for monitored leagues
+    private func discover_matches<system>() : async* () {
+      D.print("ORACLE: Discovering matches for leagues: " # debug_show (state.monitoredLeagues));
+
       // Query each monitored league
       for (leagueId in state.monitoredLeagues.vals()) {
-        D.print("ORACLE: Fetching fixtures for league: " # debug_show (leagueId));
-
-        try {
-          // Get upcoming fixtures (paid plan - uses "next" parameter)
-          // API-Football endpoint: /fixtures?league={id}&next={count}
-          // This returns the next X upcoming matches for the league
-          // Note: "next" parameter automatically uses current season
-          let url = API_FOOTBALL_URL # "/fixtures?league=" # Nat.toText(leagueId) # "&next=10";
-
-          // Create transform context if canister is available
-          let transformContext : ?HttpTypes.TransformContext = switch (environment.transform_canister) {
-            case (?canister) {
-              let actor_ref : actor {
-                transform : shared query ({
-                  context : Blob;
-                  response : HttpTypes.HttpResponse;
-                }) -> async HttpTypes.HttpResponse;
-              } = actor (Principal.toText(canister));
-              ?{
-                function = actor_ref.transform;
-                context = Blob.fromArray([]);
-              };
-            };
-            case (null) { null };
-          };
-
-          let response = await* HttpClient.makeRequest(
-            url,
-            [
-              { name = "x-apisports-key"; value = apiFootballKey },
-            ],
-            transformContext,
-          );
-
-          let bodyText = switch (Text.decodeUtf8(response.body)) {
-            case null { "" };
-            case (?text) { text };
-          };
-
-          D.print("ORACLE: Discovery response for league " # debug_show (leagueId) # ": " # bodyText);
-
-          // Parse and schedule matches
-          await* parse_and_schedule_fixtures<system>(bodyText, leagueId);
-
-        } catch (e) {
-          D.print("ORACLE: Discovery error for league " # debug_show (leagueId) # ": " # Error.message(e));
-        };
+        await* discover_matches_for_league<system>(leagueId);
       };
     };
 
@@ -665,7 +922,7 @@ module {
       };
     };
 
-    /// Start individual match timer - runs during match window
+    /// Start individual match timer - runs during match window with smart scheduling
     private func start_match_timer<system>(oracleId : Nat) : async* () {
       let match = switch (Map.get(state.scheduledMatches, Map.nhash, oracleId)) {
         case (?m) { m };
@@ -683,7 +940,21 @@ module {
       let now = natNow();
       let scheduledTime = match.scheduledTime;
 
-      // Start timer 1 hour before match
+      // OPTIMIZATION: Only start timer if match is within 2 hours of kickoff
+      let twoHours : Nat = 7_200_000_000_000;
+      let twoHoursBeforeKickoff = if (scheduledTime > twoHours) {
+        scheduledTime - twoHours;
+      } else {
+        0;
+      };
+
+      // If match is more than 2 hours away, don't start timer yet
+      if (now < twoHoursBeforeKickoff) {
+        D.print("ORACLE: Match " # debug_show(oracleId) # " is more than 2 hours away, skipping timer");
+        return;
+      };
+
+      // Start monitoring 1 hour before match
       let oneHour : Nat = 3_600_000_000_000;
       let startTime = if (scheduledTime > oneHour) {
         scheduledTime - oneHour;
@@ -691,9 +962,9 @@ module {
         scheduledTime;
       };
 
-      // Match typically lasts 2 hours (120 minutes)
-      let twoHours : Nat = 7_200_000_000_000;
-      let endTime = scheduledTime + twoHours;
+      // Match monitoring window: 3 hours after kickoff
+      let threeHours : Nat = 10_800_000_000_000;
+      let endTime = scheduledTime + threeHours;
 
       // Calculate delay until start
       let delay = if (now >= startTime) {
@@ -710,9 +981,9 @@ module {
         func() : async () {
           D.print("ORACLE: Starting match monitoring for Oracle ID " # debug_show (oracleId));
 
-          // Create recurring timer that fetches every 10 minutes during the match
+          // OPTIMIZATION: Adaptive fetch interval based on match proximity
           let matchTimerId = Timer.recurringTimer<system>(
-            #seconds(600), // Every 10 minutes
+            #seconds(900), // Every 15 minutes (reduced from 10)
             func() : async () {
               let currentTime = natNow();
 
@@ -731,6 +1002,27 @@ module {
                     Timer.cancelTimer(tid);
 
                     // Update match to clear timer ID
+                    let updatedMatch : ScheduledMatch = {
+                      currentMatch with matchTimerId = null;
+                    };
+                    Map.set(state.scheduledMatches, Map.nhash, oracleId, updatedMatch);
+                  };
+                  case (null) {};
+                };
+                return;
+              };
+
+              // OPTIMIZATION: Check if match is Final and stop timer immediately
+              let currentMatch = switch (Map.get(state.scheduledMatches, Map.nhash, oracleId)) {
+                case (?m) { m };
+                case (null) { return };
+              };
+
+              if (currentMatch.status == #Final) {
+                D.print("ORACLE: Match " # debug_show(oracleId) # " is Final, stopping timer immediately");
+                switch (currentMatch.matchTimerId) {
+                  case (?tid) {
+                    Timer.cancelTimer(tid);
                     let updatedMatch : ScheduledMatch = {
                       currentMatch with matchTimerId = null;
                     };
@@ -779,6 +1071,9 @@ module {
           case (#Cancelled) { "Cancelled" };
         };
 
+        // Get the latest event for this match (if any)
+        let latestEvent = get_latest_event(oracleId);
+
         buffer.add({
           oracleId = oracleId;
           apiFootballId = match.apiFootballId;
@@ -787,10 +1082,123 @@ module {
           league = match.league;
           scheduledTime = match.scheduledTime;
           status = statusText;
+          latestEvent = latestEvent;
         });
       };
 
       Buffer.toArray(buffer);
+    };
+
+    /// Query scheduled matches with filtering and pagination
+    public func query_scheduled_matches(request : Service.GetScheduledMatchesRequest) : [Service.ScheduledMatchInfo] {
+      let allMatches = Buffer.Buffer<Service.ScheduledMatchInfo>(Map.size(state.scheduledMatches));
+
+      // First, collect and filter all matches
+      for ((oracleId, match) in Map.entries(state.scheduledMatches)) {
+        let statusText = switch (match.status) {
+          case (#Scheduled) { "Scheduled" };
+          case (#InProgress) { "InProgress" };
+          case (#Final) { "Final" };
+          case (#Cancelled) { "Cancelled" };
+        };
+
+        // Apply filters
+        var include = true;
+
+        // Filter by start time
+        switch (request.startTime) {
+          case (?startTime) {
+            if (match.scheduledTime < startTime) {
+              include := false;
+            };
+          };
+          case (null) {};
+        };
+
+        // Filter by end time
+        switch (request.endTime) {
+          case (?endTime) {
+            if (match.scheduledTime > endTime) {
+              include := false;
+            };
+          };
+          case (null) {};
+        };
+
+        // Filter by status
+        switch (request.status) {
+          case (?filterStatus) {
+            if (statusText != filterStatus) {
+              include := false;
+            };
+          };
+          case (null) {};
+        };
+
+        // Filter by league
+        switch (request.league) {
+          case (?filterLeague) {
+            if (match.league != filterLeague) {
+              include := false;
+            };
+          };
+          case (null) {};
+        };
+
+        if (include) {
+          // Get the latest event for this match (if any)
+          let latestEvent = get_latest_event(oracleId);
+
+          allMatches.add({
+            oracleId = oracleId;
+            apiFootballId = match.apiFootballId;
+            homeTeam = match.homeTeam;
+            awayTeam = match.awayTeam;
+            league = match.league;
+            scheduledTime = match.scheduledTime;
+            status = statusText;
+            latestEvent = latestEvent;
+          });
+        };
+      };
+
+      // Sort by scheduled time (ascending)
+      let sorted = Array.sort<Service.ScheduledMatchInfo>(
+        Buffer.toArray(allMatches),
+        func(a, b) {
+          if (a.scheduledTime < b.scheduledTime) { #less } else if (a.scheduledTime > b.scheduledTime) {
+            #greater;
+          } else { #equal };
+        },
+      );
+
+      // Apply offset and limit
+      let offset = switch (request.offset) {
+        case (?o) { o };
+        case (null) { 0 };
+      };
+
+      let limit = switch (request.limit) {
+        case (?l) { l };
+        case (null) { sorted.size() };
+      };
+
+      let startIndex = Nat.min(offset, sorted.size());
+      let endIndex = Nat.min(offset + limit, sorted.size());
+
+      if (startIndex >= sorted.size()) {
+        return [];
+      };
+
+      // Extract the slice
+      let result = Buffer.Buffer<Service.ScheduledMatchInfo>(endIndex - startIndex);
+      var i = startIndex;
+      while (i < endIndex) {
+        result.add(sorted[i]);
+        i += 1;
+      };
+
+      Buffer.toArray(result);
     };
 
     /// Query all events for a match by Oracle ID
@@ -828,6 +1236,92 @@ module {
         };
         log = [];
       };
+    };
+
+    /// Restart all active match timers (called after upgrade)
+    public func restart_all_match_timers<system>() : async* () {
+      D.print("ORACLE: Restarting all active match timers after upgrade");
+      var restartedCount = 0;
+
+      for ((oracleId, match) in Map.entries(state.scheduledMatches)) {
+        // Only restart timers for matches that are still active
+        switch (match.status) {
+          case (#Scheduled or #InProgress) {
+            D.print("ORACLE: Restarting timer for Oracle ID " # debug_show (oracleId) # " (status: " # debug_show (match.status) # ")");
+            await* start_match_timer<system>(oracleId);
+            restartedCount += 1;
+          };
+          case (_) {
+            // Match is finished or cancelled, no timer needed
+          };
+        };
+      };
+
+      D.print("ORACLE: Restarted " # debug_show (restartedCount) # " match timers");
+    };
+
+    /// Check for upcoming matches and start their timers (hourly check)
+    /// This ensures matches get timers started when they come within 2 hours of kickoff
+    public func check_upcoming_matches<system>() : async* () {
+      D.print("ORACLE: Checking for upcoming matches that need timers");
+      let now = natNow();
+      let twoHours : Nat = 7_200_000_000_000;
+      var startedCount = 0;
+
+      for ((oracleId, match) in Map.entries(state.scheduledMatches)) {
+        // Only check scheduled or in-progress matches
+        switch (match.status) {
+          case (#Scheduled or #InProgress) {
+            // Check if match is within 2 hours but doesn't have a timer
+            let twoHoursBeforeKickoff = if (match.scheduledTime > twoHours) {
+              match.scheduledTime - twoHours;
+            } else {
+              0;
+            };
+
+            // If we're within the 2-hour window and there's no timer, start one
+            if (now >= twoHoursBeforeKickoff and match.matchTimerId == null) {
+              D.print("ORACLE: Starting timer for upcoming match " # debug_show(oracleId));
+              await* start_match_timer<system>(oracleId);
+              startedCount += 1;
+            };
+          };
+          case (_) {};
+        };
+      };
+
+      if (startedCount > 0) {
+        D.print("ORACLE: Started " # debug_show(startedCount) # " timers for upcoming matches");
+      };
+    };
+
+    /// Start the hourly timer that checks for upcoming matches
+    public func start_upcoming_match_check_timer<system>() : async* () {
+      // Cancel existing timer if any
+      switch (upcomingMatchCheckTimerId) {
+        case (?timerId) {
+          Timer.cancelTimer(timerId);
+          D.print("ORACLE: Cancelled existing upcoming match check timer");
+        };
+        case (null) {};
+      };
+
+      D.print("ORACLE: Starting hourly upcoming match check timer");
+
+      // Create recurring timer that runs every hour (3600 seconds)
+      let timerId = Timer.recurringTimer<system>(
+        #seconds(3600), // Every hour
+        func() : async () {
+          D.print("ORACLE: Hourly upcoming match check");
+          await* check_upcoming_matches<system>();
+        },
+      );
+
+      upcomingMatchCheckTimerId := ?timerId;
+      D.print("ORACLE: Upcoming match check timer started with ID: " # debug_show (timerId));
+
+      // Run check immediately
+      await* check_upcoming_matches<system>();
     };
 
     // --- End core Oracle Logic ---

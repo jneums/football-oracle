@@ -97,7 +97,9 @@ module {
   // Event types for the oracle
   public type EventType = {
     #MatchScheduled;
+    #MatchInProgress;
     #MatchFinal;
+    #MatchCancelled;
   };
 
   // Event data variants
@@ -107,12 +109,24 @@ module {
       awayTeam : Text;
       scheduledTime : Nat;
     };
+    #MatchInProgress : {
+      homeTeam : Text;
+      awayTeam : Text;
+      homeScore : Nat;
+      awayScore : Nat;
+      minute : ?Nat;
+    };
     #MatchFinal : {
       homeTeam : Text;
       awayTeam : Text;
       homeScore : Nat;
       awayScore : Nat;
       outcome : MatchOutcome;
+    };
+    #MatchCancelled : {
+      homeTeam : Text;
+      awayTeam : Text;
+      reason : Text; // "Postponed", "Cancelled", or "Abandoned"
     };
   };
 
@@ -153,7 +167,9 @@ module {
     switch (a, b) {
       case (#MatchScheduled, #MatchScheduled) true;
       case (#MatchFinal, #MatchFinal) true;
-      case _ false;
+      case (#MatchInProgress, #MatchInProgress) true;
+      case (#MatchCancelled, #MatchCancelled) true;
+      case (_, _) false;
     };
   };
 
@@ -161,6 +177,8 @@ module {
     switch (a) {
       case (#MatchScheduled) 0;
       case (#MatchFinal) 1;
+      case (#MatchInProgress) 2;
+      case (#MatchCancelled) 3;
     };
   };
 

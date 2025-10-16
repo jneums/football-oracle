@@ -11,6 +11,45 @@ import Float "mo:base/Float";
 
 module {
   public type Score = HttpTypes.Score;
+  public type MatchStatus = HttpTypes.MatchStatus;
+
+  /// Parse match status from API-Football status code
+  private func parseMatchStatus(statusShort : Text) : MatchStatus {
+    switch (statusShort) {
+      // Not Started
+      case ("TBD") { #NotStarted };
+      case ("NS") { #NotStarted };
+
+      // In Progress
+      case ("1H") { #InProgress };
+      case ("HT") { #InProgress };
+      case ("2H") { #InProgress };
+      case ("ET") { #InProgress };
+      case ("BT") { #InProgress }; // Break Time
+      case ("P") { #InProgress }; // Penalty
+      case ("SUSP") { #InProgress }; // Suspended
+      case ("INT") { #InProgress }; // Interrupted
+      case ("LIVE") { #InProgress };
+
+      // Finished
+      case ("FT") { #Finished };
+      case ("AET") { #Finished }; // After Extra Time
+      case ("PEN") { #Finished }; // Penalties
+
+      // Cancelled/Postponed
+      case ("PST") { #Postponed };
+      case ("CANC") { #Cancelled };
+      case ("ABD") { #Abandoned };
+      case ("AWD") { #Finished }; // Technical Loss/Awarded
+      case ("WO") { #Finished }; // WalkOver
+
+      // Unknown
+      case (_) {
+        D.print("Unknown match status: " # statusShort);
+        #Unknown;
+      };
+    };
+  };
 
   /// Parse API-Football response
   /// Expected format: { "response": [{ "fixture": {...}, "goals": { "home": 2, "away": 1 } }] }
@@ -32,23 +71,41 @@ module {
         return null;
       };
       case (#ok(json)) {
-        // Use path-based navigation: response[0].goals.home and response[0].goals.away
-        let homeScore = switch (Result.toOption(Json.getAsFloat(json, "response[0].goals.home"))) {
+        // Extract match status
+        let statusShort = switch (Result.toOption(Json.getAsText(json, "response[0].fixture.status.short"))) {
           case null {
-            D.print("API-Football: Failed to get home score from path response[0].goals.home");
+            D.print("API-Football: Failed to get status from path response[0].fixture.status.short");
             return null;
           };
-          case (?h) { Int.abs(Float.toInt(h)) };
+          case (?s) { s };
         };
-        let awayScore = switch (Result.toOption(Json.getAsFloat(json, "response[0].goals.away"))) {
-          case null {
-            D.print("API-Football: Failed to get away score from path response[0].goals.away");
+
+        let matchStatus = parseMatchStatus(statusShort);
+        D.print("API-Football: Match status: " # statusShort # " -> " # debug_show (matchStatus));
+
+        // For NotStarted, Postponed, Cancelled matches, goals may be null - return with 0-0 and status
+        // The validation logic in lib.mo will reject these based on status
+        let homeScoreFloat = Result.toOption(Json.getAsFloat(json, "response[0].goals.home"));
+        let awayScoreFloat = Result.toOption(Json.getAsFloat(json, "response[0].goals.away"));
+
+        let (homeScore, awayScore) = switch (homeScoreFloat, awayScoreFloat) {
+          case (null, null) {
+            // Goals are null (match hasn't started or scores not available yet)
+            D.print("API-Football: Goals are null, using 0-0 (status validation will handle this)");
+            (0, 0);
+          };
+          case (?h, ?a) {
+            // Both scores available
+            (Int.abs(Float.toInt(h)), Int.abs(Float.toInt(a)));
+          };
+          case (_, _) {
+            // One score null, one available - unexpected
+            D.print("API-Football: Inconsistent score data (one null, one available)");
             return null;
           };
-          case (?a) { Int.abs(Float.toInt(a)) };
         };
         D.print("API-Football: Successfully parsed scores: " # debug_show (homeScore) # "-" # debug_show (awayScore));
-        ?{ home = homeScore; away = awayScore };
+        ?{ home = homeScore; away = awayScore; status = matchStatus };
       };
     };
   };
@@ -102,7 +159,7 @@ module {
           };
         };
         D.print("TheSportsDB: Successfully parsed scores: " # debug_show (homeScore) # "-" # debug_show (awayScore));
-        ?{ home = homeScore; away = awayScore };
+        ?{ home = homeScore; away = awayScore; status = #Unknown };
       };
     };
   };
@@ -140,7 +197,7 @@ module {
           case (?a) { Int.abs(Float.toInt(a)) };
         };
         D.print("Football-Data: Successfully parsed scores: " # debug_show (homeScore) # "-" # debug_show (awayScore));
-        ?{ home = homeScore; away = awayScore };
+        ?{ home = homeScore; away = awayScore; status = #Unknown };
       };
     };
   };

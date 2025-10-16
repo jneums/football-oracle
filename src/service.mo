@@ -48,7 +48,9 @@ module {
   // --- Event types ---
   public type EventType = {
     #MatchScheduled;
+    #MatchInProgress;
     #MatchFinal;
+    #MatchCancelled;
   };
 
   // --- Event data variants ---
@@ -58,12 +60,24 @@ module {
       awayTeam : Text;
       scheduledTime : Nat;
     };
+    #MatchInProgress : {
+      homeTeam : Text;
+      awayTeam : Text;
+      homeScore : Nat;
+      awayScore : Nat;
+      minute : ?Nat; // Optional: minute of the match
+    };
     #MatchFinal : {
       homeTeam : Text;
       awayTeam : Text;
       homeScore : Nat;
       awayScore : Nat;
       outcome : MatchOutcome;
+    };
+    #MatchCancelled : {
+      homeTeam : Text;
+      awayTeam : Text;
+      reason : Text; // "Postponed", "Cancelled", or "Abandoned"
     };
   };
 
@@ -92,6 +106,17 @@ module {
     league : Text;
     scheduledTime : Nat;
     status : Text;
+    latestEvent : ?OracleEvent; // Include the latest event if available (for scores, etc.)
+  };
+
+  // --- Query parameters for scheduled matches ---
+  public type GetScheduledMatchesRequest = {
+    startTime : ?Nat; // Optional: filter matches scheduled after this time (nanoseconds)
+    endTime : ?Nat; // Optional: filter matches scheduled before this time (nanoseconds)
+    status : ?Text; // Optional: filter by status ("Scheduled", "InProgress", "Final", "Cancelled")
+    league : ?Text; // Optional: filter by league name
+    limit : ?Nat; // Optional: maximum number of matches to return (default: all)
+    offset : ?Nat; // Optional: number of matches to skip (for pagination, default: 0)
   };
 
   // --- Request Types ---
@@ -178,8 +203,11 @@ module {
     // Admin method to trigger data fetch for a match
     fetch_match_data : (FetchMatchDataRequest) -> async FetchResult;
 
-    // Public query to get all scheduled matches
+    // Public query to get all scheduled matches (deprecated - use query_scheduled_matches for filtering)
     get_scheduled_matches : query () -> async [ScheduledMatchInfo];
+
+    // Public query to get scheduled matches with filtering and pagination
+    query_scheduled_matches : query (GetScheduledMatchesRequest) -> async [ScheduledMatchInfo];
 
     // Public query to get monitored leagues
     get_monitored_leagues : query () -> async [Nat];

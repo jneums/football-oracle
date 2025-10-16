@@ -1,27 +1,29 @@
 // HTTP client for making outcalls
 import HttpTypes "types";
 import Cycles "mo:base/ExperimentalCycles";
+import IC "mo:ic";
+import { ic } "mo:ic";
 
 module {
-  public type HttpRequest = HttpTypes.HttpRequest;
+  public type HttpRequest = IC.HttpRequestArgs;
   public type HttpResponse = HttpTypes.HttpResponse;
   public type HttpHeader = HttpTypes.HttpHeader;
-  public type IC = HttpTypes.IC;
 
   /// Make HTTP GET request to external API
   public func makeRequest(url : Text, headers : [HttpHeader], transform : ?HttpTypes.TransformContext) : async* HttpResponse {
-    let ic : IC = actor ("aaaaa-aa");
-
     let request : HttpRequest = {
       url = url;
-      max_response_bytes = null; // No limit, disables consensus requirement
+      max_response_bytes = ?100_000; // 100KB limit - API-Football responses are typically 1-42KB
       headers = headers;
       body = null;
       method = #get;
       transform = transform;
+      is_replicated = ?false;
     };
 
-    // Add cycles for the HTTP outcall (21B cycles required for max_response_bytes = null)
-    await (with cycles = 21_000_000_000) ic.http_request(request);
+    // Add cycles for the HTTP outcall
+    // Base cost: 400M cycles + 100K cycles per KB + some overhead
+    // For 100KB: The actual requirement is ~1.09B cycles based on ICP pricing
+    await (with cycles = 1_200_000_000) ic.http_request(request);
   };
 };

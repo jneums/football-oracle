@@ -3,6 +3,8 @@
 
 import D "mo:base/Debug";
 import Principal "mo:base/Principal";
+import Timer "mo:base/Timer";
+import Error "mo:base/Error";
 import ClassPlus "mo:class-plus";
 import TT "mo:timer-tool";
 import Log "mo:stable-local-log";
@@ -12,6 +14,11 @@ import Map "mo:map/Map";
 import CertTree "mo:cert/CertTree";
 import Array "mo:base/Array";
 import Option "mo:base/Option";
+import Blob "mo:base/Blob";
+import Nat8 "mo:base/Nat8";
+import Nat32 "mo:base/Nat32";
+import Char "mo:base/Char";
+import Json "mo:json/lib";
 
 // Import the local library and its service definition
 import Oracle "lib";
@@ -197,6 +204,16 @@ shared (deployer) actor class FootballOracleCanister<system>(
     oracle().set_monitored_leagues(msg.caller, req.leagueIds);
   };
 
+  // Admin method to add a league to monitored leagues
+  public shared (msg) func add_league(leagueId : Nat) : async Service.SetLeaguesResult {
+    oracle().add_league(msg.caller, leagueId);
+  };
+
+  // Admin method to remove a league from monitored leagues
+  public shared (msg) func remove_league(leagueId : Nat) : async Service.SetLeaguesResult {
+    oracle().remove_league(msg.caller, leagueId);
+  };
+
   // Admin method to start discovery timer
   public shared (msg) func start_discovery_timer() : async Service.StartDiscoveryResult {
     await* oracle().start_discovery_timer<system>(msg.caller);
@@ -205,6 +222,11 @@ shared (deployer) actor class FootballOracleCanister<system>(
   // Admin method to manually trigger discovery (for testing)
   public shared (msg) func trigger_discovery() : async () {
     await* oracle().trigger_discovery<system>(msg.caller);
+  };
+
+  // Admin method to manually trigger discovery for a specific league
+  public shared (msg) func trigger_discovery_for_league(leagueId : Nat) : async () {
+    await* oracle().trigger_discovery_for_league<system>(msg.caller, leagueId);
   };
 
   // Admin method to schedule a match for monitoring (manual override)
@@ -220,6 +242,11 @@ shared (deployer) actor class FootballOracleCanister<system>(
   // Public query to get all scheduled matches
   public query func get_scheduled_matches() : async [Service.ScheduledMatchInfo] {
     oracle().get_scheduled_matches();
+  };
+
+  // Public query to get scheduled matches with filtering and pagination
+  public query func query_scheduled_matches(request : Service.GetScheduledMatchesRequest) : async [Service.ScheduledMatchInfo] {
+    oracle().query_scheduled_matches(request);
   };
 
   // Public query to get monitored leagues
@@ -265,5 +292,31 @@ shared (deployer) actor class FootballOracleCanister<system>(
       case (null) { null };
       case (?record) { ?record };
     };
+  };
+
+  // --- System Functions ---
+
+  // Post-upgrade hook to restart all active match timers
+  system func postupgrade() {
+    D.print("CANISTER: Running post-upgrade hook");
+    // Use a one-shot timer to restart match timers after upgrade
+    // This runs after the upgrade completes
+    ignore Timer.setTimer<system>(
+      #seconds(1),
+      func() : async () {
+        try {
+          D.print("CANISTER: Starting timer restart process");
+          await* oracle().restart_all_match_timers<system>();
+          D.print("CANISTER: Timer restart complete");
+          
+          // Also start the hourly upcoming match check timer
+          D.print("CANISTER: Starting upcoming match check timer");
+          await* oracle().start_upcoming_match_check_timer<system>();
+          D.print("CANISTER: Upcoming match check timer started");
+        } catch (e) {
+          D.print("CANISTER: Error in post-upgrade: " # Error.message(e));
+        };
+      },
+    );
   };
 };

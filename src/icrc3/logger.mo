@@ -23,6 +23,23 @@ module {
           ("scheduledTime", #Nat(d.scheduledTime)),
         ]);
       };
+      case (#MatchInProgress(d)) {
+        let fields = [
+          ("type", #Text("MatchInProgress")),
+          ("homeTeam", #Text(d.homeTeam)),
+          ("awayTeam", #Text(d.awayTeam)),
+          ("homeScore", #Nat(d.homeScore)),
+          ("awayScore", #Nat(d.awayScore)),
+        ];
+        // Add minute if available
+        let withMinute = switch (d.minute) {
+          case (null) { fields };
+          case (?m) {
+            Array.append(fields, [("minute", #Nat(m))]);
+          };
+        };
+        #Map(withMinute);
+      };
       case (#MatchFinal(d)) {
         let outcomeText = switch (d.outcome) {
           case (#HomeWin) "HomeWin";
@@ -36,6 +53,14 @@ module {
           ("homeScore", #Nat(d.homeScore)),
           ("awayScore", #Nat(d.awayScore)),
           ("outcome", #Text(outcomeText)),
+        ]);
+      };
+      case (#MatchCancelled(d)) {
+        #Map([
+          ("type", #Text("MatchCancelled")),
+          ("homeTeam", #Text(d.homeTeam)),
+          ("awayTeam", #Text(d.awayTeam)),
+          ("reason", #Text(d.reason)),
         ]);
       };
     };
@@ -63,7 +88,9 @@ module {
   ) : Nat {
     let eventTypeText = switch (event.eventType) {
       case (#MatchScheduled) "MatchScheduled";
+      case (#MatchInProgress) "MatchInProgress";
       case (#MatchFinal) "MatchFinal";
+      case (#MatchCancelled) "MatchCancelled";
     };
 
     let tx : ICRC16Map = [

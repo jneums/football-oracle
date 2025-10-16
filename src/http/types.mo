@@ -19,27 +19,25 @@ module {
     context : Blob;
   };
 
-  public type HttpRequest = {
-    url : Text;
-    max_response_bytes : ?Nat64;
-    headers : [HttpHeader];
-    body : ?Blob;
-    method : HttpMethod;
-    transform : ?TransformContext;
-  };
-
   public type HttpResponse = {
     status : Nat;
     headers : [HttpHeader];
     body : Blob;
   };
 
-  public type IC = actor {
-    http_request : HttpRequest -> async HttpResponse;
+  public type MatchStatus = {
+    #NotStarted; // NS, TBD, etc.
+    #InProgress; // 1H, HT, 2H, ET, P, LIVE, etc.
+    #Finished; // FT, AET, PEN
+    #Postponed; // PST
+    #Cancelled; // CANC
+    #Abandoned; // ABD
+    #Unknown;
   };
 
   public type Score = {
     home : Nat;
     away : Nat;
+    status : MatchStatus;
   };
 };
