@@ -7,6 +7,7 @@ import LogLib "mo:stable-local-log";
 import MapLib "mo:map/Map";
 import SetLib "mo:map/Set";
 import BTreeLib "mo:stableheapbtreemap/BTree";
+import IC "mo:ic";
 
 // please do not import any types from your project outside migrations folder here
 // it can lead to bugs when you change those types later, because migration types should not be changed
@@ -191,6 +192,11 @@ module {
   //--- The ICRC85 Open Value Sharing block (required infra)
   public type ICRC85Options = OVSFixed.ICRC85Environment;
 
+  public type TransformFunc = shared query ({
+    context : Blob;
+    response : IC.HttpRequestResult;
+  }) -> async IC.HttpRequestResult;
+
   //--- Environment structure for dependency injection
   public type Environment = {
     tt : TimerToolLib.TimerTool;
@@ -199,7 +205,7 @@ module {
     };
     log : Log.Local_log;
     add_record : ?(<system>(ICRC16, ?ICRC16) -> Nat);
-    transform_canister : ?Principal;
+    transform : TransformFunc;
   };
 
   //--- Statistics

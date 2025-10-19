@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "cycles": {
+      "type": "http",
+      "url": "https://imzi7-ziaaa-aaaai-q34ka-cai.icp0.io/mcp",
+      "headers": {
+        "x-api-key": "5aa82b1f12a6be40fe460b94fe2414673636f5ad4c3b95faf4c60a67d7bdedf4"
+      }
+    }
+  }
+}

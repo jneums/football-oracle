@@ -5,6 +5,8 @@ import D "mo:base/Debug";
 import Principal "mo:base/Principal";
 import Timer "mo:base/Timer";
 import Error "mo:base/Error";
+import Nat64 "mo:base/Nat64";
+import Prim "mo:⛔";
 import ClassPlus "mo:class-plus";
 import TT "mo:timer-tool";
 import Log "mo:stable-local-log";
@@ -73,11 +75,13 @@ shared (deployer) actor class FootballOracleCanister<system>(
 
   // --- TimerTool Setup ---
   private func reportTTExecution(execInfo : TT.ExecutionReport) : Bool {
-    D.print("CANISTER: TimerTool Execution: " # debug_show (execInfo));
+    // MEMORY FIX: Don't log full execution reports (can be large)
+    // D.print("CANISTER: TimerTool Execution: " # debug_show (execInfo));
     false;
   };
   private func reportTTError(errInfo : TT.ErrorReport) : ?Nat {
-    D.print("CANISTER: TimerTool Error: " # debug_show (errInfo));
+    // MEMORY FIX: Don't log full error reports (can be large)
+    // D.print("CANISTER: TimerTool Error: " # debug_show (errInfo));
     null;
   };
   stable var tt_migration_state : TT.State = TT.Migration.migration.initialState;
@@ -103,7 +107,7 @@ shared (deployer) actor class FootballOracleCanister<system>(
   // --- Logger Setup ---
   stable var localLog_migration_state : Log.State = Log.initialState();
   let localLog = Log.Init<system>({
-    args = ?{ min_level = ?#Debug; bufferSize = ?5000 };
+    args = ?{ min_level = ?#Debug; bufferSize = ?100 }; // Reduced from 5000 to 100 to save memory
     manager = initManager;
     initialState = localLog_migration_state;
     pullEnvironment = ?(
@@ -176,11 +180,12 @@ shared (deployer) actor class FootballOracleCanister<system>(
             func<system>(data : Oracle.ICRC16, meta : ?Oracle.ICRC16) : Nat {
               let converted_data = convertOracleValueToIcrc3Value(data);
               let converted_meta = Option.map(meta, convertOracleValueToIcrc3Value);
-              D.print("ORACLE: Adding record: " # debug_show ((converted_data, converted_meta)));
+              // MEMORY FIX: Don't log full ICRC-3 records (can be very large!)
+              // D.print("ORACLE: Adding record: " # debug_show ((converted_data, converted_meta)));
               icrc3().add_record<system>(converted_data, converted_meta);
             }
           );
-          transform_canister = ?thisPrincipal;
+          transform = transform;
         };
       }
     );
@@ -269,6 +274,23 @@ shared (deployer) actor class FootballOracleCanister<system>(
     oracle().get_stats();
   };
 
+  // Memory diagnostics endpoint
+  public query func get_memory_info() : async {
+    rts_memory_size : Nat;
+    rts_heap_size : Nat;
+    stable_memory_pages : Nat;
+    stable_memory_bytes : Nat;
+  } {
+    // RTS metrics and stable memory diagnostics
+    // Note: rts values are in machine words, stable memory in pages
+    {
+      rts_memory_size = Prim.rts_memory_size();
+      rts_heap_size = Prim.rts_heap_size();
+      stable_memory_pages = Nat64.toNat(Prim.stableMemorySize());
+      stable_memory_bytes = Nat64.toNat(Prim.stableMemorySize()) * 65536; // 64KB per page
+    };
+  };
+
   // --- ICRC3 Endpoints ---
   public query func icrc3_get_blocks(args : ICRC3.GetBlocksArgs) : async ICRC3.GetBlocksResult {
     icrc3().get_blocks(args);
@@ -308,7 +330,7 @@ shared (deployer) actor class FootballOracleCanister<system>(
           D.print("CANISTER: Starting timer restart process");
           await* oracle().restart_all_match_timers<system>();
           D.print("CANISTER: Timer restart complete");
-          
+
           // Also start the hourly upcoming match check timer
           D.print("CANISTER: Starting upcoming match check timer");
           await* oracle().start_upcoming_match_check_timer<system>();

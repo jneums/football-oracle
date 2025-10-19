@@ -51,9 +51,117 @@ module {
     };
   };
 
-  /// Parse API-Football response
+  /// Lightweight JSON value extractor - avoids parsing entire JSON tree
+  /// Finds a JSON field and extracts its value as text
+  private func extractJsonValue(jsonText : Text, fieldName : Text) : ?Text {
+    // Search for the field name in quotes
+    let searchFor = "\"" # fieldName # "\"";
+
+    let textChars = Text.toArray(jsonText);
+    let searchChars = Text.toArray(searchFor);
+
+    // Find the pattern
+    var matchPos = 0;
+    var foundAt : ?Nat = null;
+
+    for (i in textChars.keys()) {
+      if (textChars[i] == searchChars[matchPos]) {
+        matchPos += 1;
+        if (matchPos == searchChars.size()) {
+          foundAt := ?(i + 1);
+          matchPos := 0;
+        };
+      } else {
+        matchPos := 0;
+        // Restart matching if we see the first character
+        if (textChars[i] == searchChars[0]) {
+          matchPos := 1;
+        };
+      };
+    };
+
+    let ?startPos = foundAt else return null;
+    var i = startPos;
+
+    // Skip whitespace and find colon
+    label colonLoop while (i < textChars.size()) {
+      let c = textChars[i];
+      if (c == ':') {
+        i += 1;
+        break colonLoop;
+      };
+      if (c != ' ' and c != '\n' and c != '\r' and c != '\t') {
+        return null;
+      };
+      i += 1;
+    };
+
+    // Skip whitespace after colon
+    label wsLoop while (i < textChars.size()) {
+      let c = textChars[i];
+      if (c == ' ' or c == '\n' or c == '\r' or c == '\t') {
+        i += 1;
+      } else {
+        break wsLoop;
+      };
+    };
+
+    if (i >= textChars.size()) {
+      return null;
+    };
+
+    // Extract the value
+    let firstChar = textChars[i];
+    if (firstChar == '\"') {
+      // String value
+      i += 1;
+      var value = "";
+      label stringLoop while (i < textChars.size()) {
+        let c = textChars[i];
+        if (c == '\"') {
+          return ?value;
+        };
+        // Handle escaped quotes (basic support)
+        if (c == '\\' and i + 1 < textChars.size() and textChars[i + 1] == '\"') {
+          value #= "\"";
+          i += 2;
+        } else {
+          value #= Text.fromChar(c);
+          i += 1;
+        };
+      };
+      return null;
+    } else if (firstChar == 'n') {
+      // null value
+      return ?"null";
+    } else {
+      // Number - extract until delimiter
+      var value = "";
+      while (i < textChars.size()) {
+        let c = textChars[i];
+        if (c == ',' or c == '}' or c == ']' or c == ' ' or c == '\n' or c == '\r' or c == '\t') {
+          if (value != "") {
+            return ?value;
+          };
+          return null;
+        };
+        value #= Text.fromChar(c);
+        i += 1;
+      };
+      if (value != "") {
+        return ?value;
+      };
+      return null;
+    };
+  };
+
+  /// Parse API-Football response WITHOUT using Json.parse() to avoid memory leak
   /// Expected format: { "response": [{ "fixture": {...}, "goals": { "home": 2, "away": 1 } }] }
   public func parseApiFootball(body : Blob, _matchId : Text) : ?Score {
+    // STEP 1: Test if memory leak happens before decoding
+    D.print("DEBUG: parseApiFootball STEP 1 - Before decoding");
+    // return ?{ home = 0; away = 0; status = #Finished }; // UNCOMMENT TO TEST
+
     let text = switch (Text.decodeUtf8(body)) {
       case null {
         D.print("API-Football: Failed to decode UTF8");
@@ -62,52 +170,56 @@ module {
       case (?t) { t };
     };
 
-    D.print("API-Football response: " # text);
+    // STEP 2: Test if memory leak happens after decoding but before parsing
+    D.print("DEBUG: parseApiFootball STEP 2 - After decoding, before parsing");
+    // return ?{ home = 0; away = 0; status = #Finished }; // UNCOMMENT TO TEST
 
-    let parsed = Json.parse(text);
-    switch (parsed) {
-      case (#err(e)) {
-        D.print("API-Football: JSON parse error: " # Json.errToText(e));
+    // USE LIGHTWEIGHT EXTRACTION INSTEAD OF Json.parse()
+    // This avoids building the full JSON tree in memory
+
+    // Extract status
+    let statusShort = switch (extractJsonValue(text, "short")) {
+      case null {
+        D.print("API-Football: Failed to extract status");
         return null;
       };
-      case (#ok(json)) {
-        // Extract match status
-        let statusShort = switch (Result.toOption(Json.getAsText(json, "response[0].fixture.status.short"))) {
-          case null {
-            D.print("API-Football: Failed to get status from path response[0].fixture.status.short");
-            return null;
-          };
-          case (?s) { s };
+      case (?s) { s };
+    };
+
+    D.print("DEBUG: parseApiFootball - Extracted status without Json.parse");
+
+    let matchStatus = parseMatchStatus(statusShort);
+    D.print("API-Football: Match status: " # statusShort # " -> " # debug_show (matchStatus));
+
+    // Extract goals
+    let homeGoalText = extractJsonValue(text, "home");
+    let awayGoalText = extractJsonValue(text, "away");
+
+    let (homeScore, awayScore) = switch (homeGoalText, awayGoalText) {
+      case (null, null) {
+        D.print("API-Football: Goals are null, using 0-0");
+        (0, 0);
+      };
+      case (?h, ?a) {
+        // Parse the text values
+        let homeVal = switch (Nat.fromText(h)) {
+          case (?n) { n };
+          case (null) { 0 }; // null goals in API
         };
-
-        let matchStatus = parseMatchStatus(statusShort);
-        D.print("API-Football: Match status: " # statusShort # " -> " # debug_show (matchStatus));
-
-        // For NotStarted, Postponed, Cancelled matches, goals may be null - return with 0-0 and status
-        // The validation logic in lib.mo will reject these based on status
-        let homeScoreFloat = Result.toOption(Json.getAsFloat(json, "response[0].goals.home"));
-        let awayScoreFloat = Result.toOption(Json.getAsFloat(json, "response[0].goals.away"));
-
-        let (homeScore, awayScore) = switch (homeScoreFloat, awayScoreFloat) {
-          case (null, null) {
-            // Goals are null (match hasn't started or scores not available yet)
-            D.print("API-Football: Goals are null, using 0-0 (status validation will handle this)");
-            (0, 0);
-          };
-          case (?h, ?a) {
-            // Both scores available
-            (Int.abs(Float.toInt(h)), Int.abs(Float.toInt(a)));
-          };
-          case (_, _) {
-            // One score null, one available - unexpected
-            D.print("API-Football: Inconsistent score data (one null, one available)");
-            return null;
-          };
+        let awayVal = switch (Nat.fromText(a)) {
+          case (?n) { n };
+          case (null) { 0 }; // null goals in API
         };
-        D.print("API-Football: Successfully parsed scores: " # debug_show (homeScore) # "-" # debug_show (awayScore));
-        ?{ home = homeScore; away = awayScore; status = matchStatus };
+        (homeVal, awayVal);
+      };
+      case (_, _) {
+        D.print("API-Football: Inconsistent score data");
+        return null;
       };
     };
+
+    D.print("API-Football: Successfully parsed scores: " # debug_show (homeScore) # "-" # debug_show (awayScore));
+    ?{ home = homeScore; away = awayScore; status = matchStatus };
   };
 
   /// Parse TheSportsDB response
@@ -118,7 +230,8 @@ module {
       case (?t) { t };
     };
 
-    D.print("TheSportsDB response: " # text);
+    // MEMORY FIX: Don't log full response (can be 100KB!)
+    // D.print("TheSportsDB response: " # text);
 
     let parsed = Json.parse(text);
     switch (parsed) {
@@ -172,7 +285,8 @@ module {
       case (?t) { t };
     };
 
-    D.print("Football-Data response: " # text);
+    // MEMORY FIX: Don't log full response (can be 100KB!)
+    // D.print("Football-Data response: " # text);
 
     let parsed = Json.parse(text);
     switch (parsed) {

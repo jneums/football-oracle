@@ -117,6 +117,8 @@ module {
     league : ?Text; // Optional: filter by league name
     limit : ?Nat; // Optional: maximum number of matches to return (default: all)
     offset : ?Nat; // Optional: number of matches to skip (for pagination, default: 0)
+    sortBy : ?Text; // Optional: sort field ("scheduledTime" or "finishTime", default: "scheduledTime")
+    sortOrder : ?Text; // Optional: sort order ("asc" or "desc", default: "asc")
   };
 
   // --- Request Types ---

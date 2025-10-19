@@ -101,7 +101,8 @@ module {
       ("sourceConsensus", apiSourcesToIcrc16(event.sourceConsensus)),
     ];
     let txTop : ICRC16Map = [("btype", #Text("oracle_event"))];
-    D.print("ORACLE: Adding record: " # debug_show (#Map(tx), ?#Map(txTop)));
+    // MEMORY FIX: Don't log full ICRC-3 records (can be very large!)
+    // D.print("ORACLE: Adding record: " # debug_show (#Map(tx), ?#Map(txTop)));
     let blockIndex = add_record<system>(#Map(tx), ?#Map(txTop));
     D.print("ORACLE: Block index returned: " # debug_show (blockIndex));
     blockIndex;
