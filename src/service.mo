@@ -38,6 +38,35 @@ module {
   };
   public type ICRC16Map = [(Text, ICRC16)];
 
+  // --- Betting odds types ---
+  public type OddValue = {
+    value : Text; // "Home", "Draw", "Away"
+    odd : Text; // Decimal odds as string (e.g., "1.53")
+  };
+
+  public type Bet = {
+    id : Nat;
+    name : Text; // e.g., "Match Winner", "Goals Over/Under"
+    values : [OddValue];
+  };
+
+  public type Bookmaker = {
+    id : Nat;
+    name : Text; // e.g., "Bet365", "William Hill"
+    bets : [Bet];
+  };
+
+  public type OddsResponse = {
+    fixtureId : Nat;
+    lastUpdate : Text; // ISO timestamp
+    bookmakers : [Bookmaker];
+  };
+
+  public type FetchOddsResult = {
+    #Ok : OddsResponse;
+    #Error : Text;
+  };
+
   // --- Match outcome types ---
   public type MatchOutcome = {
     #HomeWin;
@@ -126,6 +155,12 @@ module {
     oracleId : Nat; // Now uses internal Oracle ID
   };
 
+  public type FetchOddsRequest = {
+    oracleId : Nat; // Internal Oracle match ID
+    bookmaker : ?Nat; // Optional: specific bookmaker ID (e.g., 8 for Bet365)
+    bet : ?Nat; // Optional: specific bet type ID (e.g., 1 for Match Winner)
+  };
+
   public type ScheduleMatchRequest = {
     apiFootballId : Text; // Just the API-Football ID
     homeTeam : Text;
@@ -159,6 +194,14 @@ module {
     };
   };
 
+  public type RemoveMatchResult = {
+    #Ok;
+    #Error : {
+      #Unauthorized;
+      #MatchNotFound;
+    };
+  };
+
   public type SetApiKeyResult = {
     #Ok;
     #Error : {
@@ -188,6 +231,33 @@ module {
     };
   };
 
+  // --- Timer Diagnostics ---
+  public type GetTimerDiagnosticsRequest = {
+    offset : ?Nat; // Starting index (default 0)
+    limit : ?Nat; // Max results (default 50, max 100)
+  };
+
+  public type TimerDiagnostics = {
+    oracleId : Nat;
+    homeTeam : Text;
+    awayTeam : Text;
+    scheduledTime : Nat;
+    status : Text; // "Scheduled", "InProgress", "Final", "Cancelled"
+    hasTimer : Bool;
+    timerId : ?Nat;
+    hoursUntilKickoff : Float;
+    hoursAfterKickoff : Float;
+    shouldHaveTimer : Bool; // Based on current logic (within 2h before, up to 3h after)
+    lastEventTimestamp : ?Nat;
+  };
+
+  public type TimerDiagnosticsResponse = {
+    diagnostics : [TimerDiagnostics];
+    total : Nat; // Total number of matches
+    offset : Nat;
+    limit : Nat;
+  };
+
   // --- Main Service Actor Interface ---
   public type Service = actor {
     // Admin method to set monitored leagues
@@ -205,6 +275,9 @@ module {
     // Admin method to trigger data fetch for a match
     fetch_match_data : (FetchMatchDataRequest) -> async FetchResult;
 
+    // Admin method to fetch betting odds for a match
+    fetch_odds : (FetchOddsRequest) -> async FetchOddsResult;
+
     // Public query to get all scheduled matches (deprecated - use query_scheduled_matches for filtering)
     get_scheduled_matches : query () -> async [ScheduledMatchInfo];
 
@@ -219,5 +292,8 @@ module {
 
     // Query to get the latest event for a match
     get_latest_event : query (Nat) -> async ?OracleEvent;
+
+    // Query to get timer diagnostics for debugging (paginated)
+    get_timer_diagnostics : query (GetTimerDiagnosticsRequest) -> async TimerDiagnosticsResponse;
   };
 };

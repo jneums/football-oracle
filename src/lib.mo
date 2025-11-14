@@ -17,17 +17,14 @@ import ovsfixed "mo:ovs-fixed";
 import MapLib "mo:map/Map";
 import SetLib "mo:map/Set";
 import BTreeLib "mo:stableheapbtreemap/BTree";
-import Blob "mo:base/Blob";
+import Option "mo:base/Option";
 
 // Import local modules
 import Service "service";
 import HttpClient "http/client";
 import HttpParsers "http/parsers";
-import HttpTypes "http/types";
-import Consensus "consensus/lib";
 import ICRC3Logger "icrc3/logger";
 import Json "mo:json/lib";
-import Result "mo:base/Result";
 import Float "mo:base/Float";
 
 module {
@@ -271,6 +268,37 @@ module {
 
       D.print("ORACLE: Match scheduled successfully with ID: " # debug_show (oracleId));
       #Ok(oracleId);
+    };
+
+    /// Remove a scheduled match (admin only)
+    public func remove_scheduled_match(caller : Principal, oracleId : Nat) : Service.RemoveMatchResult {
+      // Verify caller is admin
+      if (not Principal.equal(caller, state.admin)) {
+        return #Error(#Unauthorized);
+      };
+
+      // Look up the scheduled match
+      let scheduledMatch = switch (Map.get(state.scheduledMatches, Map.nhash, oracleId)) {
+        case (?match) { match };
+        case (null) {
+          return #Error(#MatchNotFound);
+        };
+      };
+
+      D.print("ORACLE: Removing match with Oracle ID: " # debug_show (oracleId));
+
+      // Remove from apiToOracleId map
+      let apiKey = "apiFootball:" # scheduledMatch.apiFootballId;
+      ignore Map.remove(state.apiToOracleId, Map.thash, apiKey);
+
+      // Remove from scheduledMatches map
+      ignore Map.remove(state.scheduledMatches, Map.nhash, oracleId);
+
+      // Note: We don't remove events from matchEvents as they're historical data
+      // and may still be useful for record-keeping
+
+      D.print("ORACLE: Match removed successfully");
+      #Ok;
     };
 
     /// Fetch match data from multiple APIs with consensus validation (updated for Oracle IDs)
@@ -643,6 +671,71 @@ module {
       #Ok(txId);
     };
 
+    /// Fetch betting odds for a specific match from API-Football
+    /// Returns raw JSON response for now
+    public func fetch_odds<system>(_caller : Principal, oracleId : Nat, bookmaker : ?Nat, bet : ?Nat) : async* Text {
+
+      // Look up the match to get its API-Football ID
+      let match = switch (Map.get(state.scheduledMatches, Map.nhash, oracleId)) {
+        case (?m) { m };
+        case (null) {
+          return "Error: Match not found with oracleId " # Nat.toText(oracleId);
+        };
+      };
+
+      let apiFootballId = match.apiFootballId;
+      D.print("ORACLE: Fetching odds for Oracle ID " # Nat.toText(oracleId) # " (API-Football ID: " # apiFootballId # ")");
+
+      // Get API key from state
+      let apiFootballKey = switch (Map.get(state.apiKeys, Map.thash, "api_football")) {
+        case (?key) { key };
+        case (null) { return "Error: API key not found" };
+      };
+
+      // Build URL with optional bookmaker and bet parameters
+      var url = API_FOOTBALL_URL # "/odds?fixture=" # apiFootballId;
+
+      switch (bookmaker) {
+        case (?bm) { url #= "&bookmaker=" # Nat.toText(bm) };
+        case (null) {};
+      };
+
+      switch (bet) {
+        case (?b) { url #= "&bet=" # Nat.toText(b) };
+        case (null) {};
+      };
+
+      D.print("ORACLE: Fetching odds from: " # url);
+
+      // Fetch from API-Football
+      try {
+        let response = await* HttpClient.makeRequest(
+          url,
+          [
+            { name = "x-apisports-key"; value = apiFootballKey },
+          ],
+          environment.transform,
+        );
+
+        D.print("ORACLE: Odds response received: " # debug_show (response.body.size()) # " bytes");
+
+        // Decode the response body to text
+        switch (Text.decodeUtf8(response.body)) {
+          case (?text) {
+            D.print("ORACLE: Successfully decoded odds response");
+            return text;
+          };
+          case (null) {
+            return "Error: Failed to decode response";
+          };
+        };
+      } catch (e) {
+        let errorMsg = "API-Football odds error: " # Error.message(e);
+        D.print(errorMsg);
+        return errorMsg;
+      };
+    };
+
     /// Start discovery timer - discovers new matches from monitored leagues
     public func start_discovery_timer<system>(caller : Principal) : async* Service.StartDiscoveryResult {
       // Verify caller is admin
@@ -758,369 +851,145 @@ module {
       };
     };
 
-    /// Find a text pattern in a larger text starting from a position
-    private func findPattern(text : Text, pattern : Text, startPos : Nat) : ?Nat {
-      let textChars = Text.toArray(text);
-      let patternChars = Text.toArray(pattern);
-
-      if (patternChars.size() == 0) { return null };
-
-      var i = startPos;
-      while (i + patternChars.size() <= textChars.size()) {
-        var match = true;
-        var j = 0;
-        while (j < patternChars.size()) {
-          if (textChars[i + j] != patternChars[j]) {
-            match := false;
-          };
-          j += 1;
-        };
-
-        if (match) {
-          return ?i;
-        };
-        i += 1;
-      };
-      null;
-    };
-
-    /// Lightweight JSON extractor for fixtures - extracts specific field from JSON without parsing full tree
-    /// maxRange: optional maximum number of characters to search from startPos (to avoid finding nested fields)
-    private func extractFixtureField(jsonText : Text, fieldName : Text, startPos : Nat, maxRange : ?Nat) : ?(Text, Nat) {
-      let searchFor = "\"" # fieldName # "\"";
-      let textChars = Text.toArray(jsonText);
-      let searchChars = Text.toArray(searchFor);
-
-      // Calculate search limit
-      let searchLimit = switch (maxRange) {
-        case (?limit) { Nat.min(startPos + limit, textChars.size()) };
-        case (null) { textChars.size() };
-      };
-
-      // Find the field name starting from startPos
-      var matchPos = 0;
-      var foundAt : ?Nat = null;
-
-      var i = startPos;
-      while (i < searchLimit) {
-        if (textChars[i] == searchChars[matchPos]) {
-          matchPos += 1;
-          if (matchPos == searchChars.size()) {
-            foundAt := ?(i + 1);
-            matchPos := 0;
-          };
-        } else {
-          matchPos := 0;
-          if (textChars[i] == searchChars[0]) {
-            matchPos := 1;
-          };
-        };
-        i += 1;
-      };
-
-      let ?startIdx = foundAt else return null;
-      i := startIdx;
-
-      // Skip whitespace and find colon
-      label colonLoop while (i < textChars.size()) {
-        let c = textChars[i];
-        if (c == ':') {
-          i += 1;
-          break colonLoop;
-        };
-        if (c != ' ' and c != '\n' and c != '\r' and c != '\t') {
-          return null;
-        };
-        i += 1;
-      };
-
-      // Skip whitespace after colon
-      label wsLoop while (i < textChars.size()) {
-        let c = textChars[i];
-        if (c == ' ' or c == '\n' or c == '\r' or c == '\t') {
-          i += 1;
-        } else {
-          break wsLoop;
-        };
-      };
-
-      if (i >= textChars.size()) { return null };
-
-      // Extract the value
-      let firstChar = textChars[i];
-      if (firstChar == '\"') {
-        // String value
-        i += 1;
-        var value = "";
-        label stringLoop while (i < textChars.size()) {
-          let c = textChars[i];
-          if (c == '\\' and i + 1 < textChars.size() and textChars[i + 1] == '\"') {
-            value #= "\"";
-            i += 2;
-          } else if (c == '\"') {
-            return ?(value, i + 1);
-          } else {
-            value #= Text.fromChar(c);
-            i += 1;
-          };
-        };
-        null;
-      } else {
-        // Number value
-        var value = "";
-        label numLoop while (i < textChars.size()) {
-          let c = textChars[i];
-          if ((c >= '0' and c <= '9') or c == '.' or c == '-' or c == 'e' or c == 'E' or c == '+') {
-            value #= Text.fromChar(c);
-            i += 1;
-          } else {
-            return ?(value, i);
-          };
-        };
-        if (value.size() > 0) {
-          ?(value, i);
-        } else {
-          null;
-        };
-      };
-    };
-
-    /// Parse fixtures response and schedule new matches WITHOUT Json.parse() to avoid memory leak
+    /// Parse fixtures response and schedule new matches using JSON library
     private func parse_and_schedule_fixtures<system>(jsonText : Text, leagueId : Nat) : async* () {
       D.print("ORACLE: Parsing fixtures response for league " # debug_show (leagueId));
 
-      // Extract results count
-      let resultsCount = switch (extractFixtureField(jsonText, "results", 0, null)) {
-        case (?(countStr, _)) {
-          switch (Nat.fromText(countStr)) {
-            case (?n) { n };
-            case (null) {
-              D.print("ORACLE: Invalid results count");
-              return;
-            };
-          };
-        };
-        case (null) {
-          D.print("ORACLE: No results field found");
+      // Parse JSON
+      let parsed = switch (Json.parse(jsonText)) {
+        case (#ok(json)) { json };
+        case (#err(e)) {
+          D.print("ORACLE: Failed to parse JSON: " # debug_show (e));
           return;
         };
       };
 
-      D.print("ORACLE: Found " # debug_show (resultsCount) # " fixtures");
-
-      if (resultsCount == 0) {
-        D.print("ORACLE: No fixtures to schedule");
-        return;
+      // Extract response array
+      let responseArray = switch (Json.get(parsed, "response")) {
+        case (?#array(items)) { items };
+        case (_) {
+          D.print("ORACLE: No response array found");
+          return;
+        };
       };
 
-      // Find the start of the response array
-      let responseArrayStart = findPattern(jsonText, "\"response\"", 0);
-      let ?arrayStartIdx = responseArrayStart else {
-        D.print("ORACLE: Could not find response array");
-        return;
+      D.print("ORACLE: Found " # debug_show (responseArray.size()) # " fixtures");
+
+      // Process each fixture
+      let now = natNow();
+      var count = 0;
+      for (fixtureJson in responseArray.vals()) {
+        if (count == 0) {
+          D.print("ORACLE: First fixture teams object: " # debug_show (Json.get(fixtureJson, "teams")));
+        };
+        count += 1;
+        ignore await* processFixture<system>(fixtureJson, leagueId, now);
       };
-
-      // Parse each fixture by scanning through the JSON text
-      var index = 0;
-      var searchPos = arrayStartIdx;
-
-      label fixtureLoop while (index < resultsCount) {
-        // Find the next fixture object by looking for the "fixture" field
-        // Start searching AFTER the previous position to avoid finding the same fixture
-        let fixturePattern = "\"fixture\"";
-        let fixtureStart = findPattern(jsonText, fixturePattern, searchPos + 1);
-        let ?fixturePos = fixtureStart else {
-          D.print("ORACLE: Could not find fixture at index " # debug_show (index) # ", searchPos was " # debug_show (searchPos));
-          break fixtureLoop;
-        };
-
-        D.print("ORACLE: Found 'fixture' pattern at position " # debug_show (fixturePos) # " for index " # debug_show (index));
-
-        // Find the opening brace of the fixture object (after "fixture":)
-        // Search for the pattern "fixture":{  to ensure we're in the right place
-        let fixtureColonPos = findPattern(jsonText, ":", fixturePos);
-        let ?colonPos = fixtureColonPos else {
-          D.print("ORACLE: Could not find colon after fixture at index " # debug_show (index));
-          index += 1;
-          searchPos := fixturePos + 20;
-          continue fixtureLoop;
-        };
-
-        let fixtureObjStart = findPattern(jsonText, "{", colonPos);
-        let ?fixtureObjPos = fixtureObjStart else {
-          D.print("ORACLE: Could not find fixture object start at index " # debug_show (index));
-          index += 1;
-          searchPos := fixturePos + 20;
-          continue fixtureLoop;
-        };
-
-        // Now extract the first "id" inside the fixture object
-        // Use a tight search range (150 chars) to ensure we get fixture.id, not league.id or team.id
-        let fixtureId = switch (extractFixtureField(jsonText, "id", fixtureObjPos, ?150)) {
-          case (?(idStr, nextPos)) {
-            D.print("ORACLE: Found fixture ID: " # idStr # " at position " # debug_show (fixtureObjPos));
-            // Update searchPos to be AFTER this entire fixture object
-            // We'll search for the closing brace of teams object to move past this fixture
-            searchPos := nextPos;
-            idStr;
-          };
-          case (null) {
-            D.print("ORACLE: Failed to get fixture ID at index " # debug_show (index));
-            index += 1;
-            searchPos := fixturePos + 100;
-            continue fixtureLoop;
-          };
-        };
-
-        // Check if already scheduled
-        let apiKey = "apiFootball:" # fixtureId;
-        switch (Map.get(state.apiToOracleId, Map.thash, apiKey)) {
-          case (?existingId) {
-            D.print("ORACLE: Fixture " # fixtureId # " already scheduled with Oracle ID " # debug_show (existingId));
-            // Move searchPos forward past this fixture so we can find the next one
-            searchPos := fixturePos + 500; // Skip past this entire fixture object
-            index += 1;
-            continue fixtureLoop;
-          };
-          case (null) {};
-        };
-
-        // Extract timestamp (still within the fixture object)
-        let timestamp = switch (extractFixtureField(jsonText, "timestamp", fixtureObjPos, ?300)) {
-          case (?(tsStr, nextPos)) {
-            searchPos := nextPos; // Advance searchPos
-            switch (Nat.fromText(tsStr)) {
-              case (?ts) { ts * 1_000_000_000 }; // Convert seconds to nanoseconds
-              case (null) {
-                D.print("ORACLE: Invalid timestamp at index " # debug_show (index));
-                index += 1;
-                continue fixtureLoop;
-              };
-            };
-          };
-          case (null) {
-            D.print("ORACLE: Failed to get timestamp at index " # debug_show (index));
-            index += 1;
-            continue fixtureLoop;
-          };
-        };
-
-        // Validate timestamp is in the future
-        let now = natNow();
-        if (timestamp < now) {
-          D.print("ORACLE: Fixture " # fixtureId # " is in the past, skipping");
-          index += 1;
-          continue fixtureLoop;
-        };
-
-        // Find teams section (search from current searchPos)
-        let teamsPattern = "\"teams\"";
-        let teamsStart = findPattern(jsonText, teamsPattern, searchPos);
-        let ?teamsPos = teamsStart else {
-          D.print("ORACLE: Could not find teams section at index " # debug_show (index));
-          index += 1;
-          searchPos += 500; // Skip ahead to avoid getting stuck
-          continue fixtureLoop;
-        };
-
-        // Extract home team (first "name" after "home")
-        let homePattern = "\"home\"";
-        let homeStart = findPattern(jsonText, homePattern, teamsPos);
-        let ?homePos = homeStart else {
-          D.print("ORACLE: Could not find home team at index " # debug_show (index));
-          index += 1;
-          searchPos := teamsPos + 100;
-          continue fixtureLoop;
-        };
-
-        let homeTeam = switch (extractFixtureField(jsonText, "name", homePos, ?200)) {
-          case (?(name, nextPos)) {
-            searchPos := nextPos;
-            name;
-          };
-          case (null) {
-            D.print("ORACLE: Failed to extract home team name at index " # debug_show (index));
-            index += 1;
-            searchPos := homePos + 100;
-            continue fixtureLoop;
-          };
-        };
-
-        // Extract away team (first "name" after "away", search from current searchPos)
-        let awayPattern = "\"away\"";
-        let awayStart = findPattern(jsonText, awayPattern, searchPos);
-        let ?awayPos = awayStart else {
-          D.print("ORACLE: Could not find away team at index " # debug_show (index));
-          index += 1;
-          searchPos += 100;
-          continue fixtureLoop;
-        };
-
-        let awayTeam = switch (extractFixtureField(jsonText, "name", awayPos, ?200)) {
-          case (?(name, nextPos)) {
-            searchPos := nextPos + 300; // Move well past this fixture for next iteration
-            name;
-          };
-          case (null) {
-            D.print("ORACLE: Failed to extract away team name at index " # debug_show (index));
-            index += 1;
-            searchPos := awayPos + 100;
-            continue fixtureLoop;
-          };
-        };
-
-        // Extract league name (look for "league" section before teams)
-        let leaguePattern = "\"league\"";
-        let leagueStart = findPattern(jsonText, leaguePattern, fixtureObjPos);
-        let leagueName = switch (leagueStart) {
-          case (?leaguePos) {
-            // Make sure we found a league section before teams (it comes between fixture and teams)
-            if (leaguePos < teamsPos) {
-              switch (extractFixtureField(jsonText, "name", leaguePos, ?200)) {
-                case (?(name, _)) { name };
-                case (null) { "League " # Nat.toText(leagueId) };
-              };
-            } else {
-              "League " # Nat.toText(leagueId);
-            };
-          };
-          case (null) { "League " # Nat.toText(leagueId) };
-        };
-
-        // Create new Oracle ID
-        let oracleId = state.nextOracleId;
-        state.nextOracleId += 1;
-
-        // Create scheduled match
-        let scheduledMatch : ScheduledMatch = {
-          oracleId = oracleId;
-          apiFootballId = fixtureId;
-          scheduledTime = timestamp;
-          homeTeam = homeTeam;
-          awayTeam = awayTeam;
-          league = leagueName;
-          status = #Scheduled;
-          lastFetchTime = null;
-          matchTimerId = null;
-        };
-
-        // Store the match
-        Map.set(state.scheduledMatches, Map.nhash, oracleId, scheduledMatch);
-        Map.set(state.apiToOracleId, Map.thash, apiKey, oracleId);
-
-        D.print("ORACLE: Auto-scheduled " # homeTeam # " vs " # awayTeam # " (Oracle ID: " # debug_show (oracleId) # ", Fixture ID: " # fixtureId # ")");
-
-        // Start match timer
-        await* start_match_timer<system>(oracleId);
-
-        // searchPos was already updated when we extracted awayTeam
-        index += 1;
-      };
-
       D.print("ORACLE: Finished scheduling fixtures for league " # debug_show (leagueId));
     };
 
-    /// Start individual match timer - runs during match window with smart scheduling    /// Start individual match timer - runs during match window with smart scheduling
+    /// Process a single fixture from JSON
+    private func processFixture<system>(fixtureJson : Json.Json, leagueId : Nat, now : Nat) : async* Bool {
+      // Extract fixture ID
+      let fixtureId = switch (Json.get(fixtureJson, "fixture.id")) {
+        case (?#number(#int(id))) { Int.toText(id) };
+        case (?#number(#float(id))) { Float.toText(id) };
+        case (_) {
+          D.print("ORACLE: No fixture ID found, skipping");
+          return false;
+        };
+      };
+
+      // Check if already scheduled - get existing oracle ID if it exists
+      let apiKey = "apiFootball:" # fixtureId;
+      let existingOracleId = Map.get(state.apiToOracleId, Map.thash, apiKey);
+
+      // Extract timestamp
+      let timestamp = switch (Json.get(fixtureJson, "fixture.timestamp")) {
+        case (?#number(#int(ts))) { Int.abs(ts) * 1_000_000_000 }; // Convert to nanoseconds
+        case (?#number(#float(ts))) {
+          let tsInt = Float.toInt(Float.abs(ts));
+          Int.abs(tsInt) * 1_000_000_000;
+        };
+        case (_) {
+          D.print("ORACLE: No timestamp for fixture " # fixtureId);
+          return false;
+        };
+      };
+
+      // Skip past matches
+      if (timestamp < now) {
+        return false;
+      };
+
+      // Extract team names
+      let homeTeam = switch (Json.get(fixtureJson, "teams.home.name")) {
+        case (?#string(name)) {
+          D.print("ORACLE: Fixture " # fixtureId # " home team: " # name);
+          name;
+        };
+        case (_) {
+          D.print("ORACLE: No home team name for fixture " # fixtureId);
+          return false;
+        };
+      };
+
+      let awayTeam = switch (Json.get(fixtureJson, "teams.away.name")) {
+        case (?#string(name)) {
+          D.print("ORACLE: Fixture " # fixtureId # " away team: " # name);
+          name;
+        };
+        case (_) {
+          D.print("ORACLE: No away team name for fixture " # fixtureId);
+          return false;
+        };
+      };
+
+      // Extract league name
+      let leagueName = switch (Json.get(fixtureJson, "league.name")) {
+        case (?#string(name)) { name };
+        case (_) { "League " # Nat.toText(leagueId) };
+      };
+
+      // Use existing Oracle ID or create new one
+      let oracleId = switch (existingOracleId) {
+        case (?id) {
+          D.print("ORACLE: Updating existing fixture " # fixtureId # " (Oracle ID: " # debug_show (id) # ")");
+          id;
+        };
+        case (null) {
+          let newId = state.nextOracleId;
+          state.nextOracleId += 1;
+          newId;
+        };
+      };
+
+      // Create scheduled match
+      let scheduledMatch : ScheduledMatch = {
+        oracleId = oracleId;
+        apiFootballId = fixtureId;
+        scheduledTime = timestamp;
+        homeTeam = homeTeam;
+        awayTeam = awayTeam;
+        league = leagueName;
+        status = #Scheduled;
+        lastFetchTime = null;
+        matchTimerId = null;
+      };
+
+      // Store the match
+      Map.set(state.scheduledMatches, Map.nhash, oracleId, scheduledMatch);
+      Map.set(state.apiToOracleId, Map.thash, apiKey, oracleId);
+
+      D.print("ORACLE: Scheduled " # homeTeam # " vs " # awayTeam # " (ID: " # debug_show (oracleId) # ")");
+
+      // Start match timer
+      await* start_match_timer<system>(oracleId);
+
+      return true;
+    };
+
+    /// Start individual match timer - runs during match window with smart scheduling
     private func start_match_timer<system>(oracleId : Nat) : async* () {
       let match = switch (Map.get(state.scheduledMatches, Map.nhash, oracleId)) {
         case (?m) { m };
@@ -1144,10 +1013,19 @@ module {
       let now = natNow();
       let scheduledTime = match.scheduledTime;
 
+      // CRITICAL: Don't start timers for matches that already ended
+      // Match monitoring window: 3 hours after kickoff
+      let threeHoursNs : Nat = 10_800_000_000_000;
+      let matchEndTime = scheduledTime + threeHoursNs;
+      if (now > matchEndTime) {
+        D.print("ORACLE: Match " # debug_show (oracleId) # " already ended, skipping timer");
+        return;
+      };
+
       // OPTIMIZATION: Only start timer if match is within 2 hours of kickoff
       let twoHours : Nat = 7_200_000_000_000;
       let twoHoursBeforeKickoff = if (scheduledTime > twoHours) {
-        scheduledTime - twoHours;
+        Nat.sub(scheduledTime, twoHours);
       } else {
         0;
       };
@@ -1161,20 +1039,16 @@ module {
       // Start monitoring 1 hour before match
       let oneHour : Nat = 3_600_000_000_000;
       let startTime = if (scheduledTime > oneHour) {
-        scheduledTime - oneHour;
+        Nat.sub(scheduledTime, oneHour);
       } else {
         scheduledTime;
       };
-
-      // Match monitoring window: 3 hours after kickoff
-      let threeHours : Nat = 10_800_000_000_000;
-      let endTime = scheduledTime + threeHours;
 
       // Calculate delay until start
       let delay = if (now >= startTime) {
         0; // Start immediately
       } else {
-        (startTime - now) / 1_000_000_000; // Convert to seconds
+        Nat.sub(startTime, now) / 1_000_000_000; // Convert to seconds
       };
 
       D.print("ORACLE: Setting up match timer for Oracle ID " # debug_show (oracleId) # " with delay " # debug_show (delay) # " seconds");
@@ -1182,7 +1056,6 @@ module {
       // MEMORY OPTIMIZATION: Store only minimal data in closure (just Nat values)
       // to avoid capturing large state objects
       let capturedOracleId = oracleId;
-      let capturedEndTime = endTime;
 
       // Create one-time timer to start the recurring fetch
       let setupTimerId = Timer.setTimer<system>(
@@ -1217,21 +1090,9 @@ module {
 
               let currentTime = natNow();
 
-              // Check if match window has ended
-              if (currentTime > capturedEndTime) {
-                D.print("ORACLE: Match window ended for Oracle ID " # debug_show (capturedOracleId) # ", stopping timer");
-
-                // Clear timer ID from state FIRST (prevents race conditions)
-                let updatedMatch : ScheduledMatch = {
-                  currentMatch with matchTimerId = null;
-                };
-                Map.set(state.scheduledMatches, Map.nhash, capturedOracleId, updatedMatch);
-                return;
-              };
-
-              // OPTIMIZATION: Check if match is Final and stop timer immediately
-              if (currentMatch.status == #Final) {
-                D.print("ORACLE: Match " # debug_show (capturedOracleId) # " is Final, stopping timer immediately");
+              // OPTIMIZATION: Check if match is Final or Cancelled and stop timer immediately
+              if (currentMatch.status == #Final or currentMatch.status == #Cancelled) {
+                D.print("ORACLE: Match " # debug_show (capturedOracleId) # " is " # debug_show (currentMatch.status) # ", stopping timer");
 
                 // Clear timer ID from state FIRST (prevents race conditions)
                 let updatedMatch : ScheduledMatch = {
@@ -1325,13 +1186,13 @@ module {
         };
 
         // Apply filters
-        var include = true;
+        var _e = true;
 
         // Filter by start time
         switch (request.startTime) {
           case (?startTime) {
             if (match.scheduledTime < startTime) {
-              include := false;
+              _e := false;
             };
           };
           case (null) {};
@@ -1341,7 +1202,7 @@ module {
         switch (request.endTime) {
           case (?endTime) {
             if (match.scheduledTime > endTime) {
-              include := false;
+              _e := false;
             };
           };
           case (null) {};
@@ -1351,7 +1212,7 @@ module {
         switch (request.status) {
           case (?filterStatus) {
             if (statusText != filterStatus) {
-              include := false;
+              _e := false;
             };
           };
           case (null) {};
@@ -1361,13 +1222,13 @@ module {
         switch (request.league) {
           case (?filterLeague) {
             if (match.league != filterLeague) {
-              include := false;
+              _e := false;
             };
           };
           case (null) {};
         };
 
-        if (include) {
+        if (_e) {
           // Get the latest event for this match (if any)
           let latestEvent = get_latest_event(oracleId);
 
@@ -1482,6 +1343,104 @@ module {
       };
     };
 
+    /// Query timer diagnostics for all scheduled matches
+    public func get_timer_diagnostics(request : Service.GetTimerDiagnosticsRequest) : Service.TimerDiagnosticsResponse {
+      let now = natNow();
+      let hourNs : Nat = 3_600_000_000_000;
+      let twoHoursNs : Nat = 7_200_000_000_000;
+      let threeHoursNs : Nat = 10_800_000_000_000;
+
+      let offset = Option.get(request.offset, 0);
+      let limit = Nat.min(Option.get(request.limit, 5), 100); // Default 5, max 100 results
+      let total = Map.size(state.scheduledMatches);
+
+      let allDiagnostics = Buffer.Buffer<Service.TimerDiagnostics>(total);
+
+      for ((oracleId, match) in Map.entries(state.scheduledMatches)) {
+        let hoursUntilKickoff = if (match.scheduledTime > now) {
+          Float.fromInt(match.scheduledTime - now) / Float.fromInt(hourNs);
+        } else {
+          0.0 - (Float.fromInt(now - match.scheduledTime) / Float.fromInt(hourNs));
+        };
+
+        let hoursAfterKickoff = if (now > match.scheduledTime) {
+          Float.fromInt(now - match.scheduledTime) / Float.fromInt(hourNs);
+        } else {
+          0.0;
+        };
+
+        // Determine if match should have timer based on current logic:
+        // - Match has started (within 1 hour before kickoff or after)
+        // - Match is not yet Final or Cancelled
+        let oneHourBeforeKickoff = if (match.scheduledTime > twoHoursNs) {
+          Nat.sub(match.scheduledTime, twoHoursNs);
+        } else {
+          0;
+        };
+
+        let shouldHaveTimer = (
+          now >= oneHourBeforeKickoff and
+          match.status != #Final and
+          match.status != #Cancelled
+        );
+
+        let statusText = switch (match.status) {
+          case (#Scheduled) { "Scheduled" };
+          case (#InProgress) { "InProgress" };
+          case (#Final) { "Final" };
+          case (#Cancelled) { "Cancelled" };
+        };
+
+        let lastEventTimestamp = switch (Map.get(state.matches, Map.nhash, oracleId)) {
+          case (?record) {
+            if (record.events.size() > 0) {
+              ?record.events[record.events.size() - 1].timestamp;
+            } else {
+              null;
+            };
+          };
+          case (null) { null };
+        };
+
+        allDiagnostics.add({
+          oracleId = oracleId;
+          homeTeam = match.homeTeam;
+          awayTeam = match.awayTeam;
+          scheduledTime = match.scheduledTime;
+          status = statusText;
+          hasTimer = Option.isSome(match.matchTimerId);
+          timerId = match.matchTimerId;
+          hoursUntilKickoff = hoursUntilKickoff;
+          hoursAfterKickoff = hoursAfterKickoff;
+          shouldHaveTimer = shouldHaveTimer;
+          lastEventTimestamp = lastEventTimestamp;
+        });
+      };
+
+      // Apply reverse pagination (most recent first)
+      let allArray = Buffer.toArray(allDiagnostics);
+      let reversedArray = Array.tabulate<Service.TimerDiagnostics>(
+        allArray.size(),
+        func(i) { allArray[allArray.size() - 1 - i] },
+      );
+      let end = Nat.min(offset + limit, reversedArray.size());
+      let paginatedDiagnostics = if (offset >= reversedArray.size()) {
+        [];
+      } else {
+        Array.tabulate<Service.TimerDiagnostics>(
+          end - offset,
+          func(i) { reversedArray[offset + i] },
+        );
+      };
+
+      {
+        diagnostics = paginatedDiagnostics;
+        total = total;
+        offset = offset;
+        limit = limit;
+      };
+    };
+
     /// Get statistics
     public func get_stats() : MigrationTypes.Current.Stats {
       {
@@ -1520,26 +1479,26 @@ module {
     };
 
     /// Check for upcoming matches and start their timers (hourly check)
-    /// This ensures matches get timers started when they come within 2 hours of kickoff
+    /// This ensures matches get timers started when they come within 1 hour of kickoff
     public func check_upcoming_matches<system>() : async* () {
       D.print("ORACLE: Checking for upcoming matches that need timers");
       let now = natNow();
-      let twoHours : Nat = 7_200_000_000_000;
+      let oneHour : Nat = 3_600_000_000_000;
       var startedCount = 0;
 
       for ((oracleId, match) in Map.entries(state.scheduledMatches)) {
         // Only check scheduled or in-progress matches
         switch (match.status) {
           case (#Scheduled or #InProgress) {
-            // Check if match is within 2 hours but doesn't have a timer
-            let twoHoursBeforeKickoff = if (match.scheduledTime > twoHours) {
-              match.scheduledTime - twoHours;
+            // Check if match is within 1 hour but doesn't have a timer
+            let oneHourBeforeKickoff = if (match.scheduledTime > oneHour) {
+              Nat.sub(match.scheduledTime, oneHour);
             } else {
               0;
             };
 
-            // If we're within the 2-hour window and there's no timer, start one
-            if (now >= twoHoursBeforeKickoff and match.matchTimerId == null) {
+            // If we're within the 1-hour window and there's no timer, start one
+            if (now >= oneHourBeforeKickoff and match.matchTimerId == null) {
               D.print("ORACLE: Starting timer for upcoming match " # debug_show (oracleId));
               await* start_match_timer<system>(oracleId);
               startedCount += 1;

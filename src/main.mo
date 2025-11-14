@@ -239,9 +239,19 @@ shared (deployer) actor class FootballOracleCanister<system>(
     await* oracle().schedule_match<system>(msg.caller, req);
   };
 
+  // Admin method to remove a scheduled match
+  public shared (msg) func remove_scheduled_match(oracleId : Nat) : async Service.RemoveMatchResult {
+    oracle().remove_scheduled_match(msg.caller, oracleId);
+  };
+
   // Admin method to fetch match data by Oracle ID
   public shared (msg) func fetch_match_data(req : Service.FetchMatchDataRequest) : async Service.FetchResult {
     await* oracle().fetch_match_data<system>(msg.caller, req.oracleId);
+  };
+
+  // Admin endpoint to fetch betting odds for a match (returns raw JSON)
+  public shared (msg) func fetch_odds(oracleId : Nat, bookmaker : ?Nat, bet : ?Nat) : async Text {
+    await* oracle().fetch_odds<system>(msg.caller, oracleId, bookmaker, bet);
   };
 
   // Public query to get all scheduled matches
@@ -267,6 +277,11 @@ shared (deployer) actor class FootballOracleCanister<system>(
   // Query to get the latest event for a match by Oracle ID
   public query func get_latest_event(oracleId : Nat) : async ?Service.OracleEvent {
     oracle().get_latest_event(oracleId);
+  };
+
+  // Query to get timer diagnostics for debugging
+  public query func get_timer_diagnostics(request : Service.GetTimerDiagnosticsRequest) : async Service.TimerDiagnosticsResponse {
+    oracle().get_timer_diagnostics(request);
   };
 
   // Get oracle statistics
