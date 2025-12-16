@@ -191,8 +191,23 @@ shared (deployer) actor class FootballOracleCanister<system>(
     );
     onStorageChange = func(state) { oracle_migration_state := state };
     onInitialize = ?(
-      func(_oracleInstance : Oracle.FootballOracle) : async* () {
+      func(oracleInstance : Oracle.FootballOracle) : async* () {
         D.print("ORACLE: Initialized");
+
+        // Start the discovery timer automatically on initialization
+        D.print("ORACLE: Starting discovery timer on initialization");
+        let discoveryResult = await* oracleInstance.start_discovery_timer<system>(_owner);
+        switch (discoveryResult) {
+          case (#Ok) {
+            D.print("ORACLE: Discovery timer started successfully");
+          };
+          case (#Error(#AlreadyRunning)) {
+            D.print("ORACLE: Discovery timer already running");
+          };
+          case (#Error(#Unauthorized)) {
+            D.print("ORACLE: ERROR - Unauthorized to start discovery timer");
+          };
+        };
       }
     );
   });
@@ -336,24 +351,10 @@ shared (deployer) actor class FootballOracleCanister<system>(
   // Post-upgrade hook to restart all active match timers
   system func postupgrade() {
     D.print("CANISTER: Running post-upgrade hook");
-    // Use a one-shot timer to restart match timers after upgrade
-    // This runs after the upgrade completes
-    ignore Timer.setTimer<system>(
-      #seconds(1),
-      func() : async () {
-        try {
-          D.print("CANISTER: Starting timer restart process");
-          await* oracle().restart_all_match_timers<system>();
-          D.print("CANISTER: Timer restart complete");
-
-          // Also start the hourly upcoming match check timer
-          D.print("CANISTER: Starting upcoming match check timer");
-          await* oracle().start_upcoming_match_check_timer<system>();
-          D.print("CANISTER: Upcoming match check timer started");
-        } catch (e) {
-          D.print("CANISTER: Error in post-upgrade: " # Error.message(e));
-        };
-      },
-    );
+    // Restart timers immediately in postupgrade
+    oracle().restart_all_match_timers_sync<system>();
+    oracle().start_upcoming_match_check_timer_sync<system>();
+    oracle().start_discovery_timer_sync<system>(_owner);
+    D.print("CANISTER: Post-upgrade complete - timers restarted");
   };
 };

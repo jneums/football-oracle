@@ -743,10 +743,12 @@ module {
         return #Error(#Unauthorized);
       };
 
-      // Check if already running
+      // Cancel existing timer if any (handles post-upgrade case where timer ID is stale)
       switch (state.discoveryTimerId) {
-        case (?_) {
-          return #Error(#AlreadyRunning);
+        case (?timerId) {
+          D.print("ORACLE: Cancelling existing discovery timer: " # debug_show (timerId));
+          Timer.cancelTimer(timerId);
+          state.discoveryTimerId := null;
         };
         case (null) {};
       };
@@ -1540,6 +1542,128 @@ module {
 
       // Run check immediately
       await* check_upcoming_matches<system>();
+    };
+
+    /// Synchronous version for postupgrade - restarts all active match timers
+    public func restart_all_match_timers_sync<system>() {
+      D.print("ORACLE: Restarting all match timers (sync)");
+      var count = 0;
+      let now = natNow();
+
+      for ((oracleId, matchInfo) in Map.entries(state.scheduledMatches)) {
+        // Only restart timers for matches that are Scheduled or InProgress
+        switch (matchInfo.status) {
+          case (#Scheduled or #InProgress) {
+            let twoHoursBefore = if (matchInfo.scheduledTime > 7_200_000_000_000) {
+              Nat.sub(matchInfo.scheduledTime, 7_200_000_000_000);
+            } else {
+              0;
+            };
+            let threeHoursAfter = matchInfo.scheduledTime + 10_800_000_000_000;
+
+            // Only create timer if within the active window
+            if (now >= twoHoursBefore and now <= threeHoursAfter) {
+              ignore create_match_timer_sync(oracleId, matchInfo);
+              count += 1;
+            };
+          };
+          case (_) {};
+        };
+      };
+
+      D.print("ORACLE: Restarted " # debug_show (count) # " match timers");
+    };
+
+    /// Synchronous version for postupgrade - starts upcoming match check timer
+    public func start_upcoming_match_check_timer_sync<system>() {
+      // Cancel existing timer if any
+      switch (upcomingMatchCheckTimerId) {
+        case (?timerId) {
+          Timer.cancelTimer(timerId);
+          D.print("ORACLE: Cancelled existing upcoming match check timer");
+        };
+        case (null) {};
+      };
+
+      D.print("ORACLE: Starting hourly upcoming match check timer (sync)");
+
+      // Create recurring timer that runs every hour
+      let timerId = Timer.recurringTimer<system>(
+        #seconds(3600),
+        func() : async () {
+          D.print("ORACLE: Hourly upcoming match check (background)");
+          // Note: We can't use await* here, but that's OK - this timer will just schedule the work
+          ignore async {
+            try {
+              await* check_upcoming_matches<system>();
+            } catch (e) {
+              D.print("ORACLE: Error in hourly check: " # Error.message(e));
+            };
+          };
+        },
+      );
+
+      upcomingMatchCheckTimerId := ?timerId;
+      D.print("ORACLE: Upcoming match check timer started with ID: " # debug_show (timerId));
+    };
+
+    /// Synchronous version for postupgrade - starts discovery timer
+    public func start_discovery_timer_sync<system>(caller : Principal) {
+      // Cancel existing timer if any
+      switch (state.discoveryTimerId) {
+        case (?timerId) {
+          Timer.cancelTimer(timerId);
+          D.print("ORACLE: Cancelled existing discovery timer");
+        };
+        case (null) {};
+      };
+
+      D.print("ORACLE: Starting discovery timer (sync)");
+
+      // Create recurring timer for daily fixture discovery
+      let timerId = Timer.recurringTimer<system>(
+        #seconds(86400), // 24 hours
+        func() : async () {
+          D.print("ORACLE: Running daily fixture discovery (background)");
+          ignore async {
+            try {
+              await* discover_matches<system>();
+            } catch (e) {
+              D.print("ORACLE: Error in discovery: " # Error.message(e));
+            };
+          };
+        },
+      );
+
+      state.discoveryTimerId := ?timerId;
+      D.print("ORACLE: Discovery timer started with ID: " # debug_show (timerId));
+    };
+
+    /// Helper to create a match timer synchronously
+    func create_match_timer_sync<system>(oracleId : Nat, matchInfo : ScheduledMatch) : Nat {
+      let timerId = Timer.recurringTimer<system>(
+        #seconds(900), // 15 minutes
+        func() : async () {
+          D.print("ORACLE: Timer fired for match " # debug_show (oracleId));
+          ignore async {
+            try {
+              let _result = await* fetch_match_data<system>(state.admin, oracleId);
+            } catch (e) {
+              D.print("ORACLE: Error fetching match " # debug_show (oracleId) # ": " # Error.message(e));
+            };
+          };
+        },
+      );
+
+      // Store the timer ID
+      let updatedInfo = {
+        matchInfo with
+        matchTimerId = ?timerId;
+      };
+      Map.set(state.scheduledMatches, Map.nhash, oracleId, updatedInfo);
+
+      D.print("ORACLE: Created timer " # debug_show (timerId) # " for match " # debug_show (oracleId));
+      timerId;
     };
 
     // --- End core Oracle Logic ---
